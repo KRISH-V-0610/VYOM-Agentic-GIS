@@ -1,0 +1,10 @@
+data/
+myenv/
+web/
+.env
+agentic_gis_db.dump
+
+paper.zip
+current-update.md
+DATA_ONBOARDING.md
+

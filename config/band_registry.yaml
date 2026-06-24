@@ -1,0 +1,49 @@
+sensors:
+  ResourceSat-2_LISS3_L2:
+    satellite: ResourceSat-2
+    gsd_m: 23.5
+    bands:
+      green: B2
+      red:   B3
+      nir:   B4
+      swir1: B5
+    has_swir: true
+
+  ResourceSat-2A_LISS3_L2:
+    satellite: ResourceSat-2A
+    gsd_m: 23.5
+    bands:
+      green: B2
+      red:   B3
+      nir:   B4
+      swir1: B5
+    has_swir: true
+
+  ResourceSat-2A_LISS4-MX70_L2:
+    satellite: ResourceSat-2A
+    gsd_m: 5.8
+    bands:
+      green: B2
+      red:   B3
+      nir:   B4
+    has_swir: false  # LISS4 has no SWIR — cannot compute NBR or MNDWI
+
+  ResourceSat-2_AWIFS_L2:
+    satellite: ResourceSat-2
+    gsd_m: 56.0
+    bands:
+      green: B2
+      red:   B3
+      nir:   B4
+      swir1: B5
+    has_swir: true
+
+  ResourceSat-2A_AWIFS_L2:
+    satellite: ResourceSat-2A
+    gsd_m: 56.0
+    bands:
+      green: B2
+      red:   B3
+      nir:   B4
+      swir1: B5
+    has_swir: true

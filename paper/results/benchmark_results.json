@@ -1,0 +1,228 @@
+{
+  "backend": "SarvamBackend",
+  "n": 10,
+  "passed": 9,
+  "pass_rate": 0.9,
+  "coverage_first_compliance": 0.8,
+  "mean_latency_s": 13.42,
+  "mean_steps": 5.7,
+  "example_sequence": [
+    "list_events",
+    "list_events",
+    "get_event_aoi",
+    "check_coverage",
+    "compare_windows"
+  ],
+  "runs": [
+    {
+      "id": "kerala_change",
+      "category": "in_coverage",
+      "query": "How did open water area change during the Kerala 2018 floods?",
+      "latency_s": 12.44,
+      "steps": 6,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "list_events",
+        "get_event_aoi",
+        "check_coverage",
+        "compare_windows"
+      ],
+      "n_tool_calls": 5,
+      "n_heavy": 0,
+      "answer": "**Answer \u2013 Open\u2011water area during the Kerala\u202f2018 floods**\n\n| Window (relative to the flood) | Mean\u202fwater\u2011area\u202f%* | Scene count |\n|--------------------------------|-------------------|-------------|\n| **pre\u2011event** (baseline)       | **10.25\u202f%**       | 1 |\n| **event** (the flood)          | **0.04\u202f%**        | 1 |\n| **post\u2011event** (no data)       | \u2013 (no scenes)     | \u2013 |\n\n\\*The metric **`water_area_pct`** is a cached, scene\u2011level index that reports the proportion of the AOI covered by open water (derived from the NDWI\u2011based flood\u2011extent product).  \n\n### What the numbers mean\n* **Pre\u2011event** \u2013 Before the flood, the AOI (the Periyar\u2011Ernakulam basin) already contained a modest amount of open water (\u2248\u202f10\u202f% of the area). This likely reflects natural water bodies (lakes, reservoirs, river channels) that are present year\u2011round.\n* **Event** \u2013 During the flood (the \u201cevent\u201d window), the water\u2011area proportion collapsed to essentially zero (\u2248\u202f0.04\u202f%). The flood\u2011extent algorithm interpreted the scene as being dominated by water\u2011covered pixels, but the cached `water_area_pct` metric shows that the *relative* open\u2011water fraction dropped by **\u2248\u202f10.2\u202fpercentage points** (\u201110.214\u202f% from pre\u2011event ",
+      "passed": true
+    },
+    {
+      "id": "kerala_flood_extent",
+      "category": "in_coverage",
+      "query": "What was the flooded area in square kilometres for the Kerala Periyar 2018 event?",
+      "latency_s": 18.61,
+      "steps": 8,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": false,
+      "tools": [
+        "list_events",
+        "list_events",
+        "list_scenes",
+        "get_event_aoi",
+        "check_coverage",
+        "scenes_by_date_range",
+        "flood_extent"
+      ],
+      "n_tool_calls": 7,
+      "n_heavy": 1,
+      "answer": "**Answer**\n\nThe flood\u2011extent analysis for the **Kerala\u202fPeriyar\u202f2018** event shows a **flooded area of\u202f\u2248\u202f0.12\u202fkm\u00b2** (0.122\u202fkm\u00b2) within the event\u2019s AOI.\n\n**Evidence**\n\n| Item | Value |\n|------|-------|\n| **Event key** | `kerala_periyar_2018` |\n| **AOI (polygon)** | `{\"type\":\"Polygon\",\"coordinates\":[[[76.0,9.5],[77.5,9.5],[77.5,11.0],[76.0,11.0],[76.0,9.5]]]}` |\n| **Scene used** | `RAF02SEP2018009009010100067SSANSTUC00GTDC` (ResourceSat\u20112A, LISS4, 2\u202fSep\u202f2018) |\n| **NDWI threshold** | 0.3 (standard flood\u2011threshold) |\n| **Water\u2011pixel count** | 3\u202f629 |\n| **Valid pixels** | 9\u202f707\u202f705 |\n| **Water\u2011area\u202f%** | 0.037\u202f% |\n| **Estimated water area** | **0.122\u202fkm\u00b2** |\n| **Geotiff export** | `RAF02SEP2018009009010100067SSANSTUC00GTDC_flood_fdeb497f.tif` |\n| **Coverage check** | `check_coverage` returned `has_data: true`, `scene_count: 88` for the AOI, confirming that at least one scene (the one above) is available. |\n| **Date window** | 2018\u201108\u201101\u202f\u2192\u202f2018\u201109\u201115 (the event window). |\n\n**Interpretation**\n\n- The flood\u2011extent tool (HEAVY raster operation) identified water where the NDWI\u202f>\u202f0.3.  \n- The resulting water\u2011area percentage (0.037\u202f%) translates to roughly **0.12\u202fkm\u00b2** of flooded land within th",
+      "passed": true
+    },
+    {
+      "id": "kerala_coverage",
+      "category": "in_coverage",
+      "query": "Do we have any satellite imagery over the Kerala Periyar basin?",
+      "latency_s": 6.3,
+      "steps": 4,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "get_event_aoi",
+        "check_coverage"
+      ],
+      "n_tool_calls": 3,
+      "n_heavy": 0,
+      "answer": "**Yes \u2013 we have satellite\u2011image coverage for the Kerala\u202fPeriyar basin.**  \n\n| Item | What the system returned |\n|------|--------------------------|\n| **Event that matches the basin** | `kerala_periyar_2018` \u2013 a recorded flood event (2018\u201108\u201115) with the primary index **NDWI** (water\u2011index). |\n| **AOI (polygon)** | `{\"type\":\"Polygon\",\"coordinates\":[[[76.0,9.5],[77.5,9.5],[77.5,11.0],[76.0,11.0],[76.0,9.5]]]}` \u2013 the exact bounding box of the Periyar basin. |\n| **Coverage check** | `check_coverage` returned: <br>\u2022 **has_data:** `true` <br>\u2022 **scene_count:** `88` <br>\u2022 **event_count:** `1` (the Periyar flood) <br>\u2022 **date_range:** `2015\u201101\u201104 \u2026 2018\u201112\u201121` (all scenes that intersect the AOI) <br>\u2022 **sensors:** `LISS3` and `LISS4` (both available for the basin). |\n| **Primary index** | NDWI (McFeeters water\u2011index) \u2013 the standard metric for flood detection. |\n\n### What this means\n- **There are 88 archived scenes** (both LISS3 and LISS4) that intersect the Periyar basin and have been processed in the VYOM catalog.  \n- The **2018 flood event** is the only recorded event that falls inside this AOI, and it is flagged with the NDWI index, which is the most reliable indicator of surface water ",
+      "passed": true
+    },
+    {
+      "id": "kerala_scenes",
+      "category": "in_coverage",
+      "query": "How many scenes and which sensors are available for the Kerala 2018 floods?",
+      "latency_s": 7.08,
+      "steps": 6,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": false,
+      "tools": [
+        "list_events",
+        "list_events",
+        "list_scenes",
+        "get_event_aoi",
+        "check_coverage"
+      ],
+      "n_tool_calls": 5,
+      "n_heavy": 0,
+      "answer": "**Answer**\n\n- **Number of scenes:**\u202f88\u202fscenes are available for the Kerala\u202f2018 flood AOI.  \n- **Sensors:**\u202fThe catalog contains scenes acquired with **LISS3** and **LISS4** sensors.\n\n**Evidence**\n\n1. The event \u201cKerala\u202f2018\u202ffloods\u201d (key\u202f`kerala_periyar_2018`) was identified in the event list.  \n2. The AOI polygon for that event was retrieved with `get_event_aoi`.  \n3. `check_coverage` was called with the AOI (GeoJSON) and returned:\n\n```json\n{\n  \"has_data\": true,\n  \"scene_count\": 88,\n  \"event_count\": 1,\n  \"date_range\": [\"2015-01-04T10:55:27+05:30\", \"2018-12-21T11:00:23+05:30\"],\n  \"sensors\": [\"LISS3\", \"LISS4\"],\n  \"events\": [\"kerala_periyar_2018\"]\n}\n```\n\nThe `scene_count` field gives the total number of scenes, and the `sensors` field lists the satellite sensors that contributed to those scenes.\n\n**Caveats**\n\n- The coverage check confirms that data exist for the AOI; however, the actual scene IDs, acquisition dates, or cloud\u2011cover percentages are not provided by this tool.  \n- Both LISS3 and LISS4 are available, but note that LISS4 does **not** include SWIR bands, so indices that require SWIR (e.g., NBR) cannot be computed for this event.  \n\n**Conclusion**\n\nFor the Kerala\u202f2018 flood e",
+      "passed": true
+    },
+    {
+      "id": "kerala_cloud",
+      "category": "in_coverage",
+      "query": "List the least cloudy scenes for the Kerala 2018 floods.",
+      "latency_s": 21.08,
+      "steps": 6,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "list_events",
+        "get_event_aoi",
+        "check_coverage",
+        "list_scenes"
+      ],
+      "n_tool_calls": 5,
+      "n_heavy": 0,
+      "answer": "",
+      "passed": true
+    },
+    {
+      "id": "kerala_ndwi",
+      "category": "in_coverage",
+      "query": "What is the mean NDWI before versus after the Kerala 2018 flood?",
+      "latency_s": 21.03,
+      "steps": 10,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "list_events",
+        "get_event_aoi",
+        "check_coverage",
+        "compare_windows",
+        "list_scenes",
+        "list_scenes",
+        "get_scene_metrics",
+        "get_scene_metrics"
+      ],
+      "n_tool_calls": 9,
+      "n_heavy": 0,
+      "answer": "**Answer \u2013 mean NDWI before vs. after the Kerala\u202f2018 flood**\n\n| Window | Scene ID (ResourceSat\u20112A\u202fLISS3) | NDWI\u202fmean (cached) |\n|--------|--------------------------------|-------------------|\n| **Pre\u2011event** (the most recent clear\u2011sky scene before the flood) | `RA318NOV2017004917010100067PSANSTUC00GTDF` | **\u20110.4091** |\n| **Post\u2011event** (the first clear\u2011sky scene after the flood) | `RA313NOV2018010032010100067PSANSTUC00GTDF` | **\u20110.3523** |\n\n### How the numbers were obtained  \n\n1. **Identify the event** \u2013 `list_events` returned the key **`kerala_periyar_2018`** (the 2018 Kerala floods).  \n2. **Get the AOI** \u2013 `get_event_aoi` gave the polygon that defines the flood\u2011affected area.  \n3. **Check coverage** \u2013 `check_coverage` confirmed that the AOI contains 88 scenes (including the pre\u2011 and post\u2011event windows).  \n4. **Find scenes** \u2013  \n   * `list_scenes` with `window_type=pre_event` returned 5 pre\u2011event scenes; only the first one (`RA318NOV2017004917010100067PSANSTUC00GTDF`) had a cached NDWI value.  \n   * `list_scenes` with `window_type=post_event` returned a single post\u2011event scene (`RA313NOV2018010032010100067PSANSTUC00GTDF`).  \n5. **Extract the NDWI mean** \u2013 `get_scene_metrics` was ",
+      "passed": true
+    },
+    {
+      "id": "assam_nodata",
+      "category": "no_data",
+      "query": "How severe were the Assam Brahmaputra 2022 floods in our imagery?",
+      "latency_s": 9.11,
+      "steps": 5,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "list_events",
+        "get_event_aoi",
+        "check_coverage"
+      ],
+      "n_tool_calls": 4,
+      "n_heavy": 0,
+      "answer": "**Answer \u2013\u202fAssam\u202fBrahmaputra\u202f2022 floods**\n\n| Item | Value |\n|------|-------|\n| **Event key** | `assam_brahmaputra_2022` |\n| **Hazard type** | Flood |\n| **Primary index** | NDWI (water\u2011positive) |\n| **AOI (bbox)** |\u202f89.5\u202f\u2013\u202f93.5\u202f\u00b0\u202fE,\u202f24.0\u202f\u2013\u202f26.5\u202f\u00b0\u202fN (a ~4\u202f\u00b0\u202f\u00d7\u202f2.5\u202f\u00b0 box covering the central Brahmaputra basin) |\n| **Date of event** |\u202f2022\u201106\u201120 |\n| **Data availability** | **No imagery found** in the VYOM catalog for this AOI (\u202f`has_data: false`\u202f) |\n\n### How we reached this conclusion\n1. **Identify the event** \u2013\u202fWe first listed all registered disaster events. The entry for the 2022 Assam\u2011Brahmaputra floods was:\n\n   ```json\n   {\n     \"key\": \"assam_brahmaputra_2022\",\n     \"hazard_type\": \"flood\",\n     \"display_name\": \"Assam floods 2022 \u201cBrahmaputra & Barak basins\u201d,\n     \"bbox\": [89.5, 24.0, 93.5, 26.5],\n     \"event_date\": \"2022-06-20\",\n     \"primary_index\": \"NDWI\"\n   }\n   ```\n\n2. **Resolve the AOI** \u2013\u202fUsing `get_event_aoi` we obtained the exact GeoJSON polygon for that event.\n\n3. **Check coverage** \u2013\u202fWe called `check_coverage` with the AOI. The response was:\n\n   ```json\n   {\n     \"has_data\": false,\n     \"scene_count\": 0,\n     \"event_count\": 0,\n     \"date_range\": null,\n     \"sensors\": [],\n",
+      "passed": true
+    },
+    {
+      "id": "uttarakhand_fire_nodata",
+      "category": "no_data",
+      "query": "Map the burn scars from the 2016 Uttarakhand forest fires.",
+      "latency_s": 13.96,
+      "steps": 6,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "list_events",
+        "get_event_aoi",
+        "check_coverage",
+        "list_scenes"
+      ],
+      "n_tool_calls": 5,
+      "n_heavy": 0,
+      "answer": "**Answer \u2013\u202fCan we map the 2016 Uttarakhand forest\u2011fire burn\u2011scar with the VYOM catalogue?**\n\n| Step | What we did | Result |\n|------|-------------|--------|\n| 1\ufe0f\u20e3  | **Identify the event** \u2013\u202f`wildfire_uttarakhand_2016` (display name \u201cUttarakhand forest fires\u202f2016\u202f\u2018burn scar mapping\u2019\u201d). | \u2705 Event found. |\n| 2\ufe0f\u20e3  | **Get the AOI** \u2013\u202fthe event\u2019s bounding\u2011box is `[78.5,\u202f29.3,\u202f80.2,\u202f30.5]`. The tool `get_event_aoi` returned a GeoJSON polygon for that area. | \u2705 AOI retrieved. |\n| 3\ufe0f\u20e3  | **Check data coverage** \u2013\u202f`check_coverage` was called with the AOI. | \u274c **`has_data: false`**, `scene_count: 0`. No scenes are stored for this AOI in the catalogue. |\n| 4\ufe0f\u20e3  | **List scenes** \u2013\u202f`list_scenes` (event\u202f=\u202f`wildfire_uttarakhand_2016`, window\u202f=\u202f`event`, sensor\u202f=\u202f`LISS4`, cloud\u202f\u2264\u202f10\u202f%). | \u274c **0 scenes** returned. |\n\n### What this means\n- **The VYOM catalogue does not contain any pre\u2011processed LISS\u20114 (or any other) scenes that intersect the 2016 Uttarakhand fire AOI.**  \n- Because there are no scenes, we cannot compute a burn\u2011scar map (e.g., NBR\u2011based change detection) directly from the available data.\n\n### How a burn\u2011scar map would be produced **if** data existed\n1. **Select the appropriate index",
+      "passed": true
+    },
+    {
+      "id": "ocean_nodata",
+      "category": "no_data",
+      "query": "Analyse flooding for the area around longitude 65, latitude 5 in the Arabian Sea.",
+      "latency_s": 5.76,
+      "steps": 1,
+      "stopped": "answer",
+      "coverage_checked": false,
+      "coverage_first_compliant": true,
+      "tools": [],
+      "n_tool_calls": 0,
+      "n_heavy": 0,
+      "answer": "**Step\u202f1 \u2013 Build an AOI around the requested point**  \nThe point you gave (longitude\u202f65\u00b0, latitude\u202f5\u00b0) in the Arabian Sea can be expressed as a GeoJSON\u202fPoint:\n\n```json\n{\n  \"type\": \"Point\",\n  \"coordinates\": [65.0, 5.0]\n}\n```\n\n**Step\u202f2 \u2013 Verify that VYOM has any data for that AOI**  \nBefore we can run any flood\u2011related analysis we must confirm that at least one scene (or a set of scenes) covers the area. The required first call is **`check_coverage`**, which returns:\n\n* `scene_count` \u2013 how many scenes intersect the AOI  \n* `has_data` \u2013 a boolean indicating whether any scene is available  \n* `events` \u2013 any registered disaster events that overlap the AOI  \n* `date_range` \u2013 the earliest and latest acquisition dates among the covering scenes  \n\n**Step\u202f3 \u2013 What we need from you**  \n\nTo move forward with a concrete flood analysis we need one of the following:\n\n| Option | What you provide | Why we need it |\n|--------|------------------|----------------|\n| **A. A specific scene ID** (e.g., `SCN\u20112024\u201100123`) | The exact scene you\u2019d like to examine. | `flood_extent` and `get_scene_metrics` require a scene identifier. |\n| **B. A date window** (e.g., `2024\u201106\u201101`\u202fto\u202f`2024\u201106\u201130`) | The period yo",
+      "passed": false
+    },
+    {
+      "id": "marathwada_drought_nodata",
+      "category": "no_data",
+      "query": "Assess the Marathwada 2016 agricultural drought from NDVI.",
+      "latency_s": 18.83,
+      "steps": 5,
+      "stopped": "answer",
+      "coverage_checked": true,
+      "coverage_first_compliant": true,
+      "tools": [
+        "list_events",
+        "list_events",
+        "get_event_aoi",
+        "check_coverage"
+      ],
+      "n_tool_calls": 4,
+      "n_heavy": 0,
+      "answer": "**Assessment of the Marathwada\u202f2016 agricultural drought (NDVI\u2011based)**  \n\n| Item | Result from the VYOM catalog |\n|------|------------------------------|\n| **Event key** | `drought_marathwada_2016` |\n| **Hazard type** | Drought |\n| **Primary index** | **VCI** (Vegetation Condition Index) \u2013 the catalog lists VCI as the drought\u2011relevant metric, not NDVI. |\n| **AOI (bbox)** | `[75.0,\u202f17.5] \u2192 [78.5,\u202f20.2]` (WGS84) |\n| **Coverage check** | `check_coverage` returned **`has_data: false`**, **`scene_count: 0`**, **`event_count: 0`** \u2013 i.e., **no satellite scenes** are stored for this AOI in the current VYOM catalog. |\n\n### What this means\n- The **VCI** (or any NDVI\u2011derived index) cannot be computed for Marathwada\u202f2016 because the required imagery is **not present** in the VYOM database.\n- Consequently, a quantitative NDVI\u2011based drought assessment (e.g., \u201cNDVI dropped by X\u202f% compared with the long\u2011term mean\u201d) cannot be performed with the available data.\n\n### Why the data are missing\n- The catalog only contains a handful of events (floods, a wildfire, a landslide, etc.). The drought event for Marathwada\u202f2016 is listed, but the **scene inventory** for that AOI is empty.\n- Possible reasons:\n ",
+      "passed": true
+    }
+  ],
+  "answer_correct_rate": 0.9,
+  "coverage_first_proposal_compliance": 0.8,
+  "coverage_checked_rate": 0.9,
+  "enforcement_guarantee": "100% by construction (policy gate blocks any data/raster tool before check_coverage)"
+}

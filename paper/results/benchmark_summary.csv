@@ -1,0 +1,11 @@
+id,category,passed,coverage_first,latency_s,steps,n_tool_calls,n_heavy,tool_sequence
+kerala_change,in_coverage,True,True,12.44,6,5,0,list_events > list_events > get_event_aoi > check_coverage > compare_windows
+kerala_flood_extent,in_coverage,False,False,18.61,8,7,1,list_events > list_events > list_scenes > get_event_aoi > check_coverage > scenes_by_date_range > flood_extent
+kerala_coverage,in_coverage,True,True,6.3,4,3,0,list_events > get_event_aoi > check_coverage
+kerala_scenes,in_coverage,False,False,7.08,6,5,0,list_events > list_events > list_scenes > get_event_aoi > check_coverage
+kerala_cloud,in_coverage,True,True,21.08,6,5,0,list_events > list_events > get_event_aoi > check_coverage > list_scenes
+kerala_ndwi,in_coverage,True,True,21.03,10,9,0,list_events > list_events > get_event_aoi > check_coverage > compare_windows > list_scenes > list_scenes > get_scene_metrics > get_scene_metrics
+assam_nodata,no_data,True,True,9.11,5,4,0,list_events > list_events > get_event_aoi > check_coverage
+uttarakhand_fire_nodata,no_data,True,True,13.96,6,5,0,list_events > list_events > get_event_aoi > check_coverage > list_scenes
+ocean_nodata,no_data,True,True,5.76,1,0,0,
+marathwada_drought_nodata,no_data,False,True,18.83,5,4,0,list_events > list_events > get_event_aoi > check_coverage

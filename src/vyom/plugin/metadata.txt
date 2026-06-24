@@ -1,0 +1,17 @@
+[general]
+name=VYOM — Agentic GIS
+qgisMinimumVersion=3.16
+qgisMaximumVersion=4.99
+description=Natural-language disaster analysis over ISRO ResourceSat imagery, powered by the VYOM agent (FastAPI backend).
+about=VYOM turns plain-English questions about Indian natural disasters (floods, wildfires, droughts, landslides) into grounded answers. This QGIS plugin is a thin client over the VYOM REST API (run `python -m vyom.api`): pick a registered event to load its AOI as a layer, ask a question, read the agent's answer + tool-call trace, and have any exported index/false-colour PNGs loaded automatically as raster layers. Requires the VYOM API server to be running and reachable from QGIS.
+version=0.1.0
+author=VYOM project
+email=harsh2004khanna@gmail.com
+tracker=https://example.invalid/vyom/issues
+repository=https://example.invalid/vyom
+homepage=https://example.invalid/vyom
+category=Plugins
+icon=
+experimental=True
+deprecated=False
+tags=gis,agent,disaster,flood,wildfire,remote sensing,isro,resourcesat,llm

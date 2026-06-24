@@ -1,0 +1,54 @@
+events:
+  - key: kerala_periyar_2018
+    hazard_type: flood
+    display_name: "Kerala floods 2018 — Periyar & Ernakulam basin"
+    bbox: [76.0, 9.5, 77.5, 11.0]
+    event_date: "2018-08-15"
+    primary_index: NDWI
+    ground_truth: "NRSC published inundation maps"
+    manifest: data/manifests/kerala_periyar_2018.csv
+
+  - key: assam_brahmaputra_2022
+    hazard_type: flood
+    display_name: "Assam floods 2022 — Brahmaputra & Barak basins"
+    bbox: [89.5, 24.0, 93.5, 26.5]
+    event_date: "2022-06-20"
+    primary_index: NDWI
+    ground_truth: "NRSC near-RT inundation maps"
+    manifest: data/manifests/assam_brahmaputra_2022.csv
+
+  - key: bihar_kosi_ganga_2019
+    hazard_type: flood
+    display_name: "Bihar floods 2019 — Ganga, Kosi, Gandak plains"
+    bbox: [84.5, 25.0, 87.5, 27.0]
+    event_date: "2019-09-28"
+    primary_index: NDWI
+    ground_truth: "CWC river gauge data"
+    manifest: data/manifests/bihar_kosi_ganga_2019.csv
+
+  - key: wildfire_uttarakhand_2016
+    hazard_type: wildfire
+    display_name: "Uttarakhand forest fires 2016 — burn scar mapping"
+    bbox: [78.5, 29.3, 80.2, 30.5]
+    event_date: "2016-04-29"
+    primary_index: NBR
+    ground_truth: "FSI fire records, 2166 km² burned"
+    manifest: data/manifests/wildfire_uttarakhand_2016.csv
+
+  - key: landslide_sikkim_glof_2023
+    hazard_type: landslide
+    display_name: "Sikkim South Lhonak GLOF 2023"
+    bbox: [88.0, 27.3, 88.7, 28.1]
+    event_date: "2023-10-04"
+    primary_index: dNDVI
+    ground_truth: "RS-2A + EOS-04 SAR validated in published papers"
+    manifest: data/manifests/landslide_sikkim_glof_2023.csv
+
+  - key: drought_marathwada_2016
+    hazard_type: drought
+    display_name: "Marathwada agricultural drought 2015-16"
+    bbox: [75.0, 17.5, 78.5, 20.2]
+    event_date: "2015-10-15"
+    primary_index: VCI
+    ground_truth: "IMD drought declaration + VCI baseline"
+    manifest: data/manifests/drought_marathwada_2016.csv
