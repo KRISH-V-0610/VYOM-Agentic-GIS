@@ -48,6 +48,9 @@ class QueryResponse(BaseModel):
     steps: int
     stopped: str
     charts: Optional[list[str]] = None
+    # Router classification from the 5-node graph (empty for the legacy/scripted path).
+    intent: Optional[str] = None
+    hazard: Optional[str] = None
     history: Optional[list[dict[str, Any]]] = None
 
 

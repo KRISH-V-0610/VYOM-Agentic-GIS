@@ -42,7 +42,7 @@ def _num(v):
 def _save(fig, out_dir: Path, name: str) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / name
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    fig.savefig(path, dpi=90, bbox_inches="tight")
     plt.close(fig)
     return name
 
@@ -69,7 +69,7 @@ def _chart_compare_windows(result: dict, out_dir: Path):
     if not values:
         return None
 
-    fig, ax = plt.subplots(figsize=(5, 3.2))
+    fig, ax = plt.subplots(figsize=(3.8, 2.4))
     bars = ax.bar(labels, values, color="#2c7fb8")
     ax.set_title(f"{metric.upper()} mean by window")
     ax.set_ylabel(f"{metric} mean")
@@ -89,7 +89,7 @@ def _chart_flood_extent(result: dict, out_dir: Path):
     km2 = _num(result.get("estimated_water_area_km2"))
     scene = result.get("scene_id") or "scene"
 
-    fig, ax = plt.subplots(figsize=(4.5, 3.2))
+    fig, ax = plt.subplots(figsize=(3.2, 2.2))
     bars = ax.bar(["Water", "Dry"], [water_pct, dry_pct],
                   color=["#045a8d", "#bdbdbd"])
     title = "Flood extent (NDWI)"
@@ -114,7 +114,7 @@ def _chart_compute_change(result: dict, out_dir: Path):
     inc, dec, unc = (inc or 0.0), (dec or 0.0), (unc or 0.0)
     index = result.get("index") or "index"
 
-    fig, ax = plt.subplots(figsize=(4.8, 3.2))
+    fig, ax = plt.subplots(figsize=(3.5, 2.2))
     bars = ax.bar(["Increased", "Decreased", "Unchanged"], [inc, dec, unc],
                   color=["#2166ac", "#b2182b", "#bdbdbd"])
     ax.set_title(f"{index.upper()} change distribution")
@@ -127,10 +127,68 @@ def _chart_compute_change(result: dict, out_dir: Path):
     return _save(fig, out_dir, name)
 
 
+def _chart_burn_severity(result: dict, out_dir: Path):
+    classes = result.get("classes")
+    if not isinstance(classes, list) or not classes:
+        return None
+    # Drop "unburned" — the interesting story is the burned bands.
+    burned = [c for c in classes if c.get("index", 0) >= 1]
+    labels = [str(c.get("name", "")).replace("_", "-") for c in burned]
+    values = [_num(c.get("pct")) or 0.0 for c in burned]
+    if not any(values):
+        return None
+    colors = ["#ffffb2", "#fecc5c", "#fd8d3c", "#e31a1c"][:len(values)]
+
+    fig, ax = plt.subplots(figsize=(3.6, 2.3))
+    bars = ax.bar(labels, values, color=colors, edgecolor="#888", linewidth=0.4)
+    km2 = _num(result.get("burned_area_km2"))
+    title = "Burn severity (dNBR)"
+    if km2 is not None:
+        title += f" — {km2:g} km² burned"
+    ax.set_title(title)
+    ax.set_ylabel("% of valid pixels")
+    for b, v in zip(bars, values):
+        ax.annotate(f"{v:.1f}%", (b.get_x() + b.get_width() / 2, v),
+                    ha="center", va="bottom", fontsize=8)
+    plt.setp(ax.get_xticklabels(), rotation=20, ha="right", fontsize=7)
+    name = f"chart_burn_{_hash([labels, values, km2])}.png"
+    return _save(fig, out_dir, name)
+
+
+def _chart_compare_events(result: dict, out_dir: Path):
+    events = result.get("events")
+    metric = result.get("metric") or "metric"
+    if not isinstance(events, list) or not events:
+        return None
+    labels, values = [], []
+    for e in events:
+        v = _num(e.get("mean"))
+        if v is None:
+            continue
+        labels.append(str(e.get("event_key", "")))
+        values.append(v)
+    if not values:
+        return None
+
+    fig, ax = plt.subplots(figsize=(4.0, 2.4))
+    bars = ax.bar(range(len(values)), values, color="#2c7fb8")
+    ax.set_title(f"{metric} by event ({result.get('window', 'event')})")
+    ax.set_ylabel(metric)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=6)
+    for b, v in zip(bars, values):
+        ax.annotate(f"{v:.2f}", (b.get_x() + b.get_width() / 2, v),
+                    ha="center", va="bottom", fontsize=7)
+    name = f"chart_events_{metric}_{_hash([labels, values])}.png"
+    return _save(fig, out_dir, name)
+
+
 _RENDERERS = {
     "compare_windows": _chart_compare_windows,
     "flood_extent": _chart_flood_extent,
     "compute_change": _chart_compute_change,
+    "burn_severity": _chart_burn_severity,
+    "compare_events": _chart_compare_events,
 }
 
 

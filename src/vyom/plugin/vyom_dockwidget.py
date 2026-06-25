@@ -29,7 +29,7 @@ import json
 import os
 import re
 
-from qgis.PyQt.QtCore import QObject, QThread, pyqtSignal, Qt, QUrl
+from qgis.PyQt.QtCore import QObject, QThread, QTimer, pyqtSignal, Qt, QUrl
 from qgis.PyQt.QtGui import QColor, QImage, QTextCursor, QTextDocument
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDockWidget, QGroupBox, QHBoxLayout,
@@ -46,8 +46,8 @@ from qgis.gui import QgsMapTool, QgsRubberBand
 
 from .api_client import (
     DEFAULT_BASE_URL, VyomApiClient, VyomApiError,
-    build_result_html, chart_filenames, confidence_badge, georef_layers,
-    layer_explanation, query_templates,
+    best_preprocessed_layer, build_result_html, chart_filenames,
+    confidence_badge, georef_layers, layer_explanation, query_templates,
 )
 
 
@@ -82,6 +82,125 @@ try:
     _CURSOR_END = QTextCursor.MoveOperation.End
 except AttributeError:
     _CURSOR_END = QTextCursor.End
+
+# ── Chat bubble HTML helpers ────────────────────────────────────────────────────
+
+_SEPARATOR = (
+    '<table width="100%" cellpadding="0" cellspacing="0">'
+    '<tr><td style="border-top:1px solid #e5e7eb;padding:2px;"></td></tr>'
+    '</table>'
+)
+
+_TOOL_ICONS = {
+    "list_events": "📋", "get_event_aoi": "🗺",
+    "check_coverage": "🔍", "compare_windows": "📊",
+    "list_scenes": "📷", "get_scene_metrics": "📈",
+    "flood_extent": "🌊", "export_png": "🖼",
+    "compute_change": "↔", "clip_to_aoi": "✂",
+    "scenes_by_date_range": "📅",
+}
+
+
+def _user_bubble(text: str) -> str:
+    """Blue right-aligned chat bubble for user messages."""
+    return (
+        '<table width="100%" cellpadding="0" cellspacing="4">'
+        '<tr><td width="18%"> </td>'
+        '<td bgcolor="#2563eb" style="padding:9px 13px;border-radius:12px 12px 4px 12px;">'
+        '<font color="#bfdbfe"><b>You</b></font><br>'
+        f'<font color="#ffffff">{text}</font>'
+        '</td></tr></table>'
+    )
+
+
+def _vyom_bubble(badge_html: str, body_html: str) -> str:
+    """Light-blue left-aligned bubble for VYOM responses."""
+    return (
+        '<table width="100%" cellpadding="0" cellspacing="4">'
+        '<tr>'
+        '<td bgcolor="#eff6ff" style="padding:9px 13px;border-radius:12px 12px 12px 4px;">'
+        f'<b>{badge_html}</b><br>'
+        f'<font color="#1e293b">{body_html}</font>'
+        '</td>'
+        '<td width="18%"> </td>'
+        '</tr></table>'
+    )
+
+
+def _thinking_bubble(steps: list) -> str:
+    """Loader bubble shown while the agent is working."""
+    if steps:
+        steps_html = "<br>".join(steps)
+        body = (f'<font color="#94a3b8"><i>thinking…</i></font><br>{steps_html}')
+    else:
+        body = '<font color="#94a3b8"><i>thinking…  ⏳</i></font>'
+    return (
+        '<table width="100%" cellpadding="0" cellspacing="4">'
+        '<tr>'
+        '<td bgcolor="#f8fafc" style="padding:9px 13px;'
+        'border-left:4px solid #2563eb;">'
+        f'<b><font color="#1d4ed8">● VYOM</font></b> {body}'
+        '</td>'
+        '<td width="18%"> </td>'
+        '</tr></table>'
+    )
+
+
+# ── Query input (Enter = send, Shift+Enter = newline) ───────────────────────────
+
+
+class _QueryEdit(QPlainTextEdit):
+    """QPlainTextEdit that emits ``submit`` on Enter; Shift+Enter inserts a newline."""
+    submit = pyqtSignal()
+
+    def keyPressEvent(self, event):  # noqa: N802
+        try:
+            ret = (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            shift = Qt.KeyboardModifier.ShiftModifier
+        except AttributeError:
+            ret = (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            shift = Qt.ShiftModifier
+        if event.key() in ret and not (event.modifiers() & shift):
+            self.submit.emit()
+            return
+        super().keyPressEvent(event)
+
+
+# ── Streaming worker ────────────────────────────────────────────────────────────
+
+
+class _StreamWorker(QObject):
+    """Reads /query/stream SSE on a background thread; emits one signal per tool."""
+
+    tool_event = pyqtSignal(dict)   # emitted for each completed tool call
+    token_event = pyqtSignal(str)   # emitted for each streamed text token
+    done_event = pyqtSignal(dict)   # emitted with the full result when stream ends
+    failed = pyqtSignal(str)        # emitted on network/server error
+
+    def __init__(self, client, question, max_steps, aoi_geojson):
+        super().__init__()
+        self._client = client
+        self._question = question
+        self._max_steps = max_steps
+        self._aoi = aoi_geojson
+
+    def run(self):
+        try:
+            def on_event(event):
+                kind = event.get("type")
+                if kind == "tool":
+                    self.tool_event.emit(event)
+                elif kind == "token":
+                    self.token_event.emit(event.get("text", ""))
+
+            result = self._client.query_stream(
+                self._question, self._max_steps, self._aoi, on_event=on_event
+            )
+            self.done_event.emit(result)
+        except VyomApiError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class _ChatBrowser(QTextBrowser):
@@ -180,15 +299,24 @@ class VyomDockWidget(QDockWidget):
     def __init__(self, iface, parent=None):
         super().__init__("VYOM — Agentic GIS", parent)
         self.iface = iface
-        self._threads = []           # keep refs so threads aren't GC'd mid-run
-        self._events = []            # cached /events payload
-        self._transcript_html = ""   # accumulated chat-bubble HTML
-        self._last_answer_md = ""    # for "copy answer"
-        self._last_vyom_layer = None # for the opacity slider
-        self._result_extent = None   # zoom union for a query's layers
+        self._threads = []               # keep refs so threads aren't GC'd mid-run
+        self._events = []                # cached /events payload
+        self._transcript_html = ""       # completed chat bubbles (user + VYOM)
+        self._thinking_html = ""         # in-progress streaming bubble
+        self._thinking_steps = []        # tool steps accumulated during streaming
+        self._streaming_answer = ""      # tokens accumulated during answer streaming
+        self._got_first_token = False    # True once the LLM starts outputting text
+        self._last_answer_md = ""        # for "copy answer"
+        self._last_vyom_layer = None     # for the opacity slider
+        self._result_extent = None       # zoom union for a query's layers
         self._custom_aoi_geojson = None  # user-drawn AOI (JSON string)
         self._aoi_tool = None
         self._prev_map_tool = None
+        # Debounce token renders — update UI at most every 60ms (≈16 fps)
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(60)
+        self._render_timer.timeout.connect(self._render_all)
         self._build_ui()
 
     # ── UI construction ──────────────────────────────────────────────────────────
@@ -228,58 +356,62 @@ class VyomDockWidget(QDockWidget):
     def _build_chat_tab(self) -> QWidget:
         tab = QWidget()
         l = QVBoxLayout(tab)
+        l.setSpacing(4)
+        l.setContentsMargins(4, 4, 4, 4)
 
-        # Event picker + add AOI
-        ev = QGroupBox("Event")
-        ev_l = QHBoxLayout(ev)
+        # Top bar: event picker + AOI (compact single row)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(4)
         self.event_combo = QComboBox()
         self.event_combo.setToolTip("Registered disaster events (loaded on Connect)")
         self.event_combo.currentIndexChanged.connect(self._on_event_changed)
-        self.aoi_btn = QPushButton("Add AOI layer")
+        self.aoi_btn = QPushButton("AOI")
+        self.aoi_btn.setToolTip("Add the event bounding box as a map layer")
+        self.aoi_btn.setFixedWidth(44)
         self.aoi_btn.setEnabled(False)
         self.aoi_btn.clicked.connect(self._on_add_aoi)
-        ev_l.addWidget(self.event_combo, 1)
-        ev_l.addWidget(self.aoi_btn)
-        l.addWidget(ev)
+        top_row.addWidget(self.event_combo, 1)
+        top_row.addWidget(self.aoi_btn)
+        l.addLayout(top_row)
 
-        # Templates
-        tmpl_row = QHBoxLayout()
-        tmpl_row.addWidget(QLabel("Templates:"))
-        self.template_combo = QComboBox()
-        self.template_combo.addItem("— pick an example question —", None)
-        self.template_combo.currentIndexChanged.connect(self._on_template_picked)
-        tmpl_row.addWidget(self.template_combo, 1)
-        l.addLayout(tmpl_row)
-
-        # Query box
-        self.query_edit = QPlainTextEdit()
-        self.query_edit.setPlaceholderText(
-            "e.g. How did water area change in the Kerala 2018 floods?")
-        self.query_edit.setFixedHeight(60)
-        l.addWidget(self.query_edit)
-
-        steps_row = QHBoxLayout()
-        steps_row.addWidget(QLabel("Max steps:"))
-        self.steps_spin = QSpinBox()
-        self.steps_spin.setRange(1, 30)
-        self.steps_spin.setValue(12)
-        steps_row.addWidget(self.steps_spin)
-        steps_row.addStretch(1)
-        self.ask_btn = QPushButton("Ask")
-        self.ask_btn.clicked.connect(self._on_ask)
-        steps_row.addWidget(self.ask_btn)
-        l.addLayout(steps_row)
-
-        # Conversation
-        l.addWidget(QLabel("Conversation:"))
+        # ── Conversation fills all remaining space ──────────────────────────────
         self.answer_view = _ChatBrowser()
         self.answer_view.setReadOnly(True)
         l.addWidget(self.answer_view, 1)
 
-        self.copy_btn = QPushButton("Copy last answer")
+        # ── Input area at the bottom (chat-style) ───────────────────────────────
+        self.query_edit = _QueryEdit()
+        self.query_edit.setPlaceholderText(
+            "Ask anything… (Enter to send, Shift+Enter for newline)")
+        self.query_edit.setFixedHeight(52)
+        self.query_edit.submit.connect(self._on_ask)
+        l.addWidget(self.query_edit)
+
+        # Bottom row: templates | max-steps | Ask | Copy
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(4)
+        self.template_combo = QComboBox()
+        self.template_combo.setToolTip("Example questions")
+        self.template_combo.addItem("— examples —", None)
+        self.template_combo.currentIndexChanged.connect(self._on_template_picked)
+        self.steps_spin = QSpinBox()
+        self.steps_spin.setRange(1, 30)
+        self.steps_spin.setValue(12)
+        self.steps_spin.setFixedWidth(48)
+        self.steps_spin.setToolTip("Max tool-call steps")
+        self.ask_btn = QPushButton("Ask")
+        self.ask_btn.setFixedWidth(52)
+        self.ask_btn.clicked.connect(self._on_ask)
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setFixedWidth(52)
         self.copy_btn.setEnabled(False)
+        self.copy_btn.setToolTip("Copy last answer to clipboard")
         self.copy_btn.clicked.connect(self._on_copy_answer)
-        l.addWidget(self.copy_btn)
+        bottom_row.addWidget(self.template_combo, 1)
+        bottom_row.addWidget(self.steps_spin)
+        bottom_row.addWidget(self.ask_btn)
+        bottom_row.addWidget(self.copy_btn)
+        l.addLayout(bottom_row)
 
         return tab
 
@@ -586,30 +718,218 @@ class VyomDockWidget(QDockWidget):
     def _ask(self, question: str):
         self.trace_view.clear()
         self._result_extent = None
-        self._append_html(f"<p><b>You:</b> {html.escape(question)}</p>")
+        self._thinking_steps = []
+        self._streaming_answer = ""
+        self._got_first_token = False
+
+        # Show user bubble immediately — don't wait for the server.
+        self._transcript_html += _user_bubble(html.escape(question))
+        self._thinking_html = _thinking_bubble([])
+        self._render_all()
         self.query_edit.clear()
-        aoi = self._custom_aoi_geojson
-        self._run_async(
-            self._client().query, self._on_answer,
-            question, self.steps_spin.value(), False, aoi,
-            busy_msg="Asking VYOM (this can take a while)…",
+
+        self._run_stream(question, self.steps_spin.value(), self._custom_aoi_geojson)
+
+    def _run_stream(self, question: str, max_steps: int, aoi_geojson: str):
+        """Launch a _StreamWorker on a background QThread."""
+        self._set_busy(True, "Asking VYOM (streaming)…")
+        client = self._client()
+        thread = QThread()
+        worker = _StreamWorker(client, question, max_steps, aoi_geojson)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def _cleanup():
+            thread.quit()
+            thread.wait()
+            if thread in self._threads:
+                self._threads.remove(thread)
+
+        def _on_tool(event):
+            step_html = self._format_tool_step(event)
+            self._thinking_steps.append(step_html)
+            if not self._got_first_token:
+                self._thinking_html = _thinking_bubble(self._thinking_steps)
+                self._render_all()
+
+        def _on_token(token: str):
+            self._streaming_answer += token
+            if not self._got_first_token:
+                self._got_first_token = True
+            # Show growing answer; debounced via QTimer
+            self._thinking_html = self._make_streaming_html()
+            if not self._render_timer.isActive():
+                self._render_timer.start()
+
+        def _on_done(result):
+            self._render_timer.stop()
+            self._set_busy(False)
+            _cleanup()
+            self._thinking_html = ""
+            self._streaming_answer = ""
+            self._got_first_token = False
+            self._on_stream_done(result)
+
+        def _on_err(msg):
+            self._render_timer.stop()
+            self._set_busy(False)
+            _cleanup()
+            self._thinking_html = ""
+            self._streaming_answer = ""
+            self._got_first_token = False
+            self._render_all()
+            self._set_status(msg, error=True)
+
+        worker.tool_event.connect(_on_tool)
+        worker.token_event.connect(_on_token)
+        worker.done_event.connect(_on_done)
+        worker.failed.connect(_on_err)
+        thread._worker = worker
+        self._threads.append(thread)
+        thread.start()
+
+    @staticmethod
+    def _format_tool_step(event: dict) -> str:
+        """Format one tool event as a short HTML line for the thinking bubble."""
+        name = event.get("name", "?")
+        icon = _TOOL_ICONS.get(name, "⚙")
+        step = event.get("step", "?")
+        result = event.get("result") or {}
+        if isinstance(result, dict):
+            if "error" in result:
+                summary = (
+                    f'<font color="#ef4444">⚠ '
+                    f'{html.escape(str(result["error"])[:60])}</font>')
+            elif name == "check_coverage":
+                has_d = result.get("has_data")
+                cnt = result.get("scene_count", "?")
+                summary = f'has_data={has_d}, {cnt} scenes'
+            elif name == "compare_windows":
+                metric = result.get("metric", "metric")
+                wnames = list((result.get("windows") or {}).keys())[:3]
+                summary = f'{html.escape(metric)}, windows: {", ".join(wnames)}'
+            elif name == "flood_extent":
+                pct = result.get("water_area_pct")
+                km2 = result.get("estimated_water_area_km2")
+                summary = (f'{pct:.2f}% water, {km2:.1f} km²'
+                           if pct is not None and km2 is not None else "computed")
+            elif name == "list_events":
+                summary = f'{result.get("count", "?")} events'
+            elif name == "list_scenes":
+                summary = f'{len(result.get("scenes") or [])} scenes'
+            else:
+                keys = [k for k in list(result.keys())[:4]]
+                summary = "{" + ", ".join(html.escape(k) for k in keys) + "}"
+        else:
+            summary = html.escape(str(result)[:60])
+        return (f'<font color="#64748b">{icon} #{step} '
+                f'<b>{html.escape(name)}</b></font>'
+                f'<font color="#475569"> → {summary}</font>')
+
+    def _make_streaming_html(self) -> str:
+        """Render the in-progress VYOM bubble showing typed tokens so far."""
+        safe = html.escape(self._streaming_answer)
+        # Blinking cursor character shown at the end while typing
+        body = f'{safe}<font color="#2563eb">▊</font>'
+        return _vyom_bubble(
+            '● <font color="#1e40af">VYOM</font>'
+            ' <font color="#94a3b8">typing…</font>',
+            body,
         )
 
     # ── chat transcript rendering ──────────────────────────────────────────────
 
-    def _append_html(self, fragment: str):
-        self._transcript_html += fragment
-        self.answer_view.setHtml(self._transcript_html)
-        self._scroll_to_end()
-
-    def _scroll_to_end(self):
+    def _render_all(self):
+        """Rebuild the chat view from completed transcript + current thinking bubble."""
+        self.answer_view.setHtml(self._transcript_html + self._thinking_html)
         cursor = self.answer_view.textCursor()
         cursor.movePosition(_CURSOR_END)
         self.answer_view.setTextCursor(cursor)
         self.answer_view.ensureCursorVisible()
 
+    def _append_html(self, fragment: str):
+        """Append a completed HTML fragment (e.g. layer explanation) to transcript."""
+        self._transcript_html += fragment
+        self._render_all()
+
     @staticmethod
-    def _markdown_body(md: str) -> str:
+    @staticmethod
+    def _strip_latex(text: str) -> str:
+        """Convert LaTeX math notation to readable plain text.
+
+        All regex patterns are built at call-time from chr() + re.escape() so
+        the Edit tool cannot corrupt them by doubling literal backslashes.
+        """
+        # chr codes — no backslash literals touch the Edit tool
+        _BS  = chr(92)   # backslash
+        _DLR = chr(36)   # dollar sign
+        _OBR = chr(91)   # [
+        _CBR = chr(93)   # ]
+        _OPR = chr(40)   # (
+        _CPR = chr(41)   # )
+        _NL  = chr(10)   # newline
+
+        # \text{X} / \mathbf{X} / \mathrm{X} → X
+        text = re.sub(
+            re.escape(_BS) + r'(?:text|mathbf|mathrm|mathit|boldsymbol)' +
+            re.escape('{') + r'([^{}]*)' + re.escape('}'),
+            lambda m: m.group(1), text)
+
+        # \frac{A}{B} → (A / B)  — 3 passes for nesting
+        _frac = (re.escape(_BS + 'frac') +
+                 re.escape('{') + r'([^{}]*)' + re.escape('}') +
+                 re.escape('{') + r'([^{}]*)' + re.escape('}'))
+        for _ in range(3):
+            text = re.sub(_frac, lambda m: f'({m.group(1)}) / ({m.group(2)})', text)
+
+        # \[ ... \] display math
+        _lb = re.escape(_BS + _OBR)
+        _rb = re.escape(_BS + _CBR)
+        text = re.sub(_lb + r'(.*?)' + _rb,
+                      lambda m: f'`{m.group(1).strip()}`', text, flags=re.DOTALL)
+
+        # \( ... \) inline math
+        _lp = re.escape(_BS + _OPR)
+        _rp = re.escape(_BS + _CPR)
+        text = re.sub(_lp + r'(.*?)' + _rp,
+                      lambda m: f'`{m.group(1).strip()}`', text, flags=re.DOTALL)
+
+        # [ formula ] on its own line (common Sarvam pattern)
+        text = re.sub(
+            r'(?m)^[ ]*' + re.escape(_OBR) + r'(.*?)' + re.escape(_CBR) + r'[ ]*$',
+            lambda m: f'`{m.group(1).strip()}`', text)
+
+        # $$ ... $$ and $ ... $
+        _D = re.escape(_DLR)
+        text = re.sub(_D + _D + r'(.*?)' + _D + _D,
+                      lambda m: f'`{m.group(1).strip()}`', text, flags=re.DOTALL)
+        text = re.sub(_D + r'([^' + _DLR + _NL + r']+?)' + _D,
+                      lambda m: f'`{m.group(1)}`', text)
+
+        # Simple symbol replacements via str.replace — no regex, no escaping issues
+        _SYM = [
+            (_BS + 'times',  chr(215)), (_BS + 'cdot',   chr(183)),
+            (_BS + 'approx', chr(8776)), (_BS + 'geq',   chr(8805)),
+            (_BS + 'leq',    chr(8804)), (_BS + 'neq',   chr(8800)),
+            (_BS + 'pm',     chr(177)),  (_BS + 'infty',  chr(8734)),
+            (_BS + 'sigma',  chr(963)),  (_BS + 'alpha',  chr(945)),
+            (_BS + 'beta',   chr(946)),  (_BS + 'gamma',  chr(947)),
+            (_BS + 'delta',  chr(948)),  (_BS + 'mu',     chr(956)),
+            (_BS + 'lambda', chr(955)),  (_BS + 'theta',  chr(952)),
+            (_BS + 'pi',     chr(960)),  (_BS + 'sqrt',   'sqrt'),
+            (_BS + 'left(',  '('),       (_BS + 'right)', ')'),
+            (_BS + 'left[',  '['),       (_BS + 'right]', ']'),
+        ]
+        for src, dst in _SYM:
+            text = text.replace(src, dst)
+
+        # Strip any remaining \command tokens
+        text = re.sub(re.escape(_BS) + r'[a-zA-Z]+', '', text)
+
+        return text
+
+    def _markdown_body(self, md: str) -> str:
+        md = self._strip_latex(md)
         doc = QTextDocument()
         if hasattr(doc, "setMarkdown"):
             doc.setMarkdown(md)
@@ -618,53 +938,137 @@ class VyomDockWidget(QDockWidget):
             return m.group(1) if m else full
         return "<pre>%s</pre>" % html.escape(md)
 
-    def _on_answer(self, result: dict):
+    def _on_stream_done(self, result: dict):
+        """Handle the completed result — build VYOM bubble + load layers."""
         answer_md = result.get("answer") or "_(no answer returned)_"
         self._last_answer_md = answer_md
         self.copy_btn.setEnabled(True)
 
-        level, color, reason = confidence_badge(result)
-        header = (f'<p><span style="color:{color};">●</span> <b>VYOM</b> '
-                  f'<i>({level} confidence)</i></p>')
-        bubble = [header, self._markdown_body(answer_md),
-                  f'<p><i style="color:{color};">{html.escape(reason)}</i></p>']
+        badge = confidence_badge(result)   # None for conversational replies
+        if badge:
+            level, color, reason = badge
+            badge_html = (
+                f'<font color="{color}">●</font> <font color="#1e40af">VYOM</font> '
+                f'<font color="#94a3b8">({level} confidence)</font>'
+            )
+            confidence_note = (
+                f'<p><i><font color="{color}">{html.escape(reason)}</font></i></p>')
+        else:
+            level = "n/a"
+            badge_html = '<font color="#1e40af">● VYOM</font>'
+            confidence_note = ""
+
+        body_parts = [self._markdown_body(answer_md), confidence_note]
 
         tables = build_result_html(result)
         if tables:
-            bubble.append("<br>" + tables)
+            body_parts.append("<br>" + tables)
 
         charts = chart_filenames(result)
-        for fname in charts:
-            bubble.append(f'<br><img src="{html.escape(fname)}">')
 
-        bubble.append("<hr>")
-        self._append_html("".join(bubble))
+        # Insert a loading-spinner placeholder for chart area.
+        # A unique token lets us swap it for real <img> tags in one setHtml call
+        # instead of N re-renders (one per chart).
+        _charts_token = f"<!--vyom-charts-{id(result)}-->"
+        if charts:
+            n = len(charts)
+            _chart_placeholder = (
+                _charts_token +
+                f'<div style="margin:6px 0;padding:10px 12px;background:#eff6ff;'
+                f'border-left:3px solid #3b82f6;border-radius:4px;'
+                f'font-size:12px;color:#1e40af;">'
+                f'&#9203; Loading {n} chart{"s" if n > 1 else ""}…</div>'
+            )
+            body_parts.append("<br>" + _chart_placeholder)
+        else:
+            _chart_placeholder = ""
+
+        self._transcript_html += _vyom_bubble(badge_html, "".join(body_parts))
+        self._transcript_html += _SEPARATOR
+        self._render_all()
 
         self._render_trace(result)
+        conf_str = f"{level} confidence" if badge else "no data tools"
         self.run_label.setText(
             f"{result.get('steps')} steps · stopped={result.get('stopped')} · "
-            f"coverage_checked={result.get('coverage_checked')} · confidence={level}")
-        self._set_status(
-            f"Done — {result.get('steps')} steps, {level} confidence.")
+            f"coverage_checked={result.get('coverage_checked')} · {conf_str}")
+        self._set_status(f"Done — {result.get('steps')} steps.")
 
-        # Download charts → inline images.
-        for fname in charts:
+        # Download ALL charts in one batch thread → single setHtml swap when ready.
+        if charts:
+            _placeholder_ref = "<br>" + _chart_placeholder
+
+            def _batch_download_charts():
+                client = self._client()
+                paths = {}
+                for fname in charts:
+                    try:
+                        paths[fname] = client.download_export(fname)
+                    except Exception:
+                        pass
+                return paths
+
+            def _on_all_charts_ready(paths: dict):
+                if not paths:
+                    return
+                for name, path in paths.items():
+                    self.answer_view.add_image(name, path)
+                imgs = "".join(
+                    f'<br><img src="{html.escape(n)}" width="320">'
+                    for n in charts
+                    if n in paths
+                )
+                self._transcript_html = self._transcript_html.replace(
+                    _placeholder_ref, imgs, 1)
+                self._render_all()
+                self._scroll_to_end()
+
+            n_charts = len(charts)
             self._run_async(
-                self._client().download_export, self._on_chart_downloaded,
-                fname, busy_msg=f"Downloading chart {fname}…")
+                _batch_download_charts, _on_all_charts_ready,
+                busy_msg=f"Loading {n_charts} chart{'s' if n_charts > 1 else ''}…")
 
         # Download georeferenced GeoTIFFs → styled, positioned raster layers + explainer.
-        for layer in georef_layers(result):
+        analysis_layers = georef_layers(result)
+        for layer in analysis_layers:
             self._run_async(
                 self._client().download_export,
                 lambda path, lyr=layer: self._add_georef_raster(
-                    path, lyr.get("kind"), lyr.get("bounds_wgs84")),
+                    path, lyr.get("kind"), lyr.get("bounds_wgs84"),
+                    lyr.get("layer_name")),
                 layer["filename"], busy_msg=f"Downloading {layer['filename']}…")
+
+        # Fallback: if no raster tool ran (catalog-only query like compare_windows),
+        # stream the primary-index COG for the resolved scene via vsicurl so the
+        # map is never empty for analysis queries.
+        if not analysis_layers and result.get("intent") in ("analyze", "discover"):
+            base_url = self.url_edit.text().strip() or DEFAULT_BASE_URL
+
+            def _add_preprocessed():
+                desc = best_preprocessed_layer(result, base_url)
+                return desc   # pass to done-callback on GUI thread
+
+            def _on_preprocessed(desc):
+                if not desc:
+                    return
+                vsicurl_path = desc.get("vsicurl_path")
+                if vsicurl_path:
+                    self._add_vsicurl_layer(vsicurl_path, desc.get("kind", "index"),
+                                            desc.get("bounds_wgs84"),
+                                            desc.get("layer_name", "Preprocessed COG"))
+
+            self._run_async(_add_preprocessed, _on_preprocessed,
+                            busy_msg="Resolving map layer…")
+
+    def _scroll_to_end(self):
+        """Scroll the chat browser to the bottom after adding new content."""
+        sb = self.answer_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_chart_downloaded(self, path: str):
         name = os.path.basename(path)
         self.answer_view.add_image(name, path)
-        self.answer_view.setHtml(self._transcript_html)
+        self._render_all()
         self._scroll_to_end()
 
     def _on_copy_answer(self):
@@ -695,8 +1099,9 @@ class VyomDockWidget(QDockWidget):
 
     # ── raster layer styling ────────────────────────────────────────────────────
 
-    def _add_georef_raster(self, path: str, kind: str, bounds_wgs84):
-        name = os.path.basename(path)
+    def _add_georef_raster(self, path: str, kind: str, bounds_wgs84,
+                           layer_name: str = None):
+        name = layer_name or os.path.splitext(os.path.basename(path))[0]
         layer = QgsRasterLayer(path, f"VYOM — {name}")
         if not layer.isValid():
             self._set_status(f"Could not load raster {name}.", error=True)
@@ -722,6 +1127,36 @@ class VyomDockWidget(QDockWidget):
                 f'<span style="color:#1b3a5b;">{body}</span>'
                 f'</td></tr></table>')
 
+    def _add_vsicurl_layer(self, vsicurl_path: str, kind: str, bounds_wgs84,
+                           layer_name: str = "Preprocessed COG"):
+        """Add a COG via GDAL vsicurl — streams range-requests, no full download.
+
+        This is the fallback path for catalog-only queries (compare_windows etc.)
+        where no analysis GeoTIFF was produced.  The COG already lives on the local
+        server so the vsicurl head-request is ~50ms; QGIS loads overview tiles only.
+        """
+        try:
+            from osgeo import gdal
+            gdal.SetConfigOption("GDAL_HTTP_PROXY", "")           # bypass corp proxy
+            gdal.SetConfigOption("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+            gdal.SetConfigOption("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif")
+        except ImportError:
+            pass
+
+        layer = QgsRasterLayer(vsicurl_path, f"VYOM — {layer_name}")
+        if not layer.isValid():
+            # vsicurl failed (e.g. proxy); skip silently — catalog answer is complete.
+            return
+        self._style_raster(layer, kind)
+        QgsProject.instance().addMapLayer(layer)
+        self._last_vyom_layer = layer
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(85)
+        self.opacity_slider.blockSignals(False)
+        self.opacity_label.setText("85%")
+        self._zoom_to_bounds(bounds_wgs84)
+        self._set_status(f"Added preprocessed layer: {layer_name}")
+
     def _style_raster(self, layer, kind: str):
         if kind == "rgb":
             return  # default multiband RGB renderer is correct for false_color
@@ -733,6 +1168,26 @@ class VyomDockWidget(QDockWidget):
                 ramp.setColorRampItemList([
                     QgsColorRampShader.ColorRampItem(0, QColor(0, 0, 0, 0), "dry"),
                     QgsColorRampShader.ColorRampItem(1, QColor(0, 90, 200, 255), "water"),
+                ])
+                shader.setRasterShaderFunction(ramp)
+                layer.setRenderer(QgsSingleBandPseudoColorRenderer(
+                    layer.dataProvider(), 1, shader))
+            except Exception:
+                pass
+            return
+
+        if kind == "burn":
+            # 5 USGS dNBR classes (0 unburned … 4 high) — matches _DNBR_COLORMAP.
+            try:
+                shader = QgsRasterShader()
+                ramp = QgsColorRampShader()
+                ramp.setColorRampType(QgsColorRampShader.Discrete)
+                ramp.setColorRampItemList([
+                    QgsColorRampShader.ColorRampItem(0, QColor(0, 0, 0, 0), "unburned"),
+                    QgsColorRampShader.ColorRampItem(1, QColor(255, 255, 178, 255), "low"),
+                    QgsColorRampShader.ColorRampItem(2, QColor(254, 204, 92, 255), "moderate-low"),
+                    QgsColorRampShader.ColorRampItem(3, QColor(253, 141, 60, 255), "moderate-high"),
+                    QgsColorRampShader.ColorRampItem(4, QColor(227, 26, 28, 255), "high"),
                 ])
                 shader.setRasterShaderFunction(ramp)
                 layer.setRenderer(QgsSingleBandPseudoColorRenderer(
@@ -865,6 +1320,10 @@ class VyomDockWidget(QDockWidget):
                 project.removeMapLayer(layer.id())
         self.iface.mapCanvas().refresh()
         self._transcript_html = ""
+        self._thinking_html = ""
+        self._thinking_steps = []
+        self._streaming_answer = ""
+        self._got_first_token = False
         self.answer_view.setHtml("")
         self.trace_view.clear()
         self._last_vyom_layer = None

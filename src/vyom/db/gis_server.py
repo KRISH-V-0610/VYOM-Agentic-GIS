@@ -81,6 +81,28 @@ def _get_scene_row(scene_id: str) -> tuple[dict, float]:
     return (assets or {}), gsd_m
 
 
+def _get_scene_meta(scene_id: str) -> dict:
+    """Return human-readable scene metadata for provenance reporting."""
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT sensor, satellite, acq_datetime::date, cloud_cover, window_type "
+            "FROM scenes WHERE id = %s",
+            (scene_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return {"scene_id": scene_id}
+    sensor, satellite, acq_date, cloud, window_type = row
+    return {
+        "scene_id": scene_id,
+        "sensor": sensor,
+        "satellite": satellite,
+        "date": acq_date.isoformat() if acq_date else None,
+        "cloud_cover": float(cloud) if cloud is not None else None,
+        "window_type": window_type,
+    }
+
+
 def _resolve_asset(assets: dict, key: str, scene_id: str) -> Path:
     """Resolve a relative asset path to an absolute Path, asserting it exists."""
     rel = assets.get(key)
@@ -293,6 +315,8 @@ def compute_change(
     """
     assets_a, _ = _get_scene_row(scene_id_a)
     assets_b, _ = _get_scene_row(scene_id_b)
+    meta_a = _get_scene_meta(scene_id_a)
+    meta_b = _get_scene_meta(scene_id_b)
     path_a = _resolve_asset(assets_a, index, scene_id_a)
     path_b = _resolve_asset(assets_b, index, scene_id_b)
 
@@ -343,6 +367,12 @@ def compute_change(
     except Exception:  # georeferencing is additive — never fail the analysis on it
         geotiff_path = crs_out = bounds_wgs84 = None
 
+    # Descriptive layer name for the QGIS panel.
+    date_a = meta_a.get("date") or "?"
+    date_b = meta_b.get("date") or "?"
+    sensor = meta_a.get("sensor") or meta_b.get("sensor") or "?"
+    layer_name = f"Δ{index.upper()} {sensor} {date_a}→{date_b}"
+
     return {
         "scene_a": scene_id_a,
         "scene_b": scene_id_b,
@@ -356,6 +386,152 @@ def compute_change(
         "valid_pixel_pairs": n_valid,
         "stats_a": _array_stats(arr_a, index),
         "stats_b": _array_stats(arr_b, index),
+        "scene_a_meta": meta_a,
+        "scene_b_meta": meta_b,
+        "layer_name": layer_name,
+        "geotiff_path": geotiff_path,
+        "crs": crs_out,
+        "bounds_wgs84": bounds_wgs84,
+    }
+
+
+# USGS / Key & Benson (2006) dNBR burn-severity breakpoints. dNBR = NBR_pre − NBR_post,
+# so a POSITIVE delta means vegetation/biomass loss (burn). Index 0..4 maps to the class.
+_DNBR_CLASS_BREAKS = [0.10, 0.27, 0.44, 0.66]   # upper bounds for classes 0..3; >last = 4
+_DNBR_CLASS_NAMES = ["unburned", "low", "moderate_low", "moderate_high", "high"]
+# RGBA colormap for the classified GeoTIFF — unburned transparent, hotter = redder.
+_DNBR_COLORMAP = {
+    0: (0, 0, 0, 0),
+    1: (255, 255, 178, 255),
+    2: (254, 204, 92, 255),
+    3: (253, 141, 60, 255),
+    4: (227, 26, 28, 255),
+    255: (0, 0, 0, 0),
+}
+
+
+def burn_severity(
+    scene_id_a: str,
+    scene_id_b: str,
+    aoi_geojson: dict = None,
+) -> dict:
+    """Classified burn-severity map from dNBR between a pre-fire and post-fire scene.
+
+    The wildfire analog of flood_extent. dNBR = NBR(pre) − NBR(post); positive values
+    indicate biomass loss. Pixels are classified into USGS/Key&Benson severity bands
+    and the burned area per class is estimated from the sensor GSD.
+
+    Both scenes MUST have an 'nbr' asset — only SWIR sensors (LISS3, AWiFS) carry it.
+    LISS4 lacks SWIR, so NBR (and therefore this tool) is unavailable for LISS4 scenes;
+    in that case the underlying _resolve_asset raises and the agent gets an honest error.
+
+    Args:
+        scene_id_a: PRE-fire baseline scene.
+        scene_id_b: POST-fire scene.
+        aoi_geojson: optional AOI geometry/Feature/FeatureCollection (WGS84).
+
+    Returns:
+        {
+          "scene_a", "scene_b", "aoi_hash",
+          "mean_dnbr", "valid_pixel_pairs", "gsd_m",
+          "classes": [{"index", "name", "pixels", "pct", "area_km2"} ...],  # 5 bands
+          "burned_pixels", "burned_pct", "burned_area_km2",  # classes 1..4 combined
+          "scene_a_meta", "scene_b_meta", "layer_name",
+          "geotiff_path", "crs", "bounds_wgs84"
+        }
+    """
+    assets_a, _ = _get_scene_row(scene_id_a)
+    assets_b, gsd_m = _get_scene_row(scene_id_b)
+    meta_a = _get_scene_meta(scene_id_a)
+    meta_b = _get_scene_meta(scene_id_b)
+    path_a = _resolve_asset(assets_a, "nbr", scene_id_a)  # raises if no SWIR (LISS4)
+    path_b = _resolve_asset(assets_b, "nbr", scene_id_b)
+
+    if aoi_geojson is not None:
+        geom = _to_geometry(aoi_geojson)
+        aoi_h = _aoi_hash(geom)
+        arr_a, _, _ = _read_clipped(path_a, geom)
+        arr_b, transform_b, crs_b = _read_clipped(path_b, geom)
+    else:
+        aoi_h = "full_scene"
+        arr_a, _, _ = _read_full(path_a)
+        arr_b, transform_b, crs_b = _read_full(path_b)
+
+    # Trim to shared extent (same-event scenes can differ by a row/col).
+    min_rows = min(arr_a.shape[0], arr_b.shape[0])
+    min_cols = min(arr_a.shape[1], arr_b.shape[1])
+    arr_a = arr_a[:min_rows, :min_cols]
+    arr_b = arr_b[:min_rows, :min_cols]
+
+    valid = np.isfinite(arr_a) & np.isfinite(arr_b)
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        return {
+            "scene_a": scene_id_a, "scene_b": scene_id_b, "aoi_hash": aoi_h,
+            "error": "No overlapping valid pixels found between the two scenes.",
+        }
+
+    # dNBR = pre − post → positive = burn.
+    dnbr = np.where(valid, arr_a - arr_b, np.nan).astype("float32")
+    dnbr_valid = dnbr[valid]
+
+    # Classify: np.digitize maps each value to 0..4 via the breakpoints.
+    class_grid = np.where(
+        valid, np.digitize(dnbr, _DNBR_CLASS_BREAKS).astype("uint8"), 255
+    )
+    classes_valid = class_grid[valid]
+
+    px_area_km2 = (gsd_m / 1000.0) ** 2 if gsd_m else None
+    classes = []
+    for idx, name in enumerate(_DNBR_CLASS_NAMES):
+        pixels = int((classes_valid == idx).sum())
+        classes.append({
+            "index": idx,
+            "name": name,
+            "pixels": pixels,
+            "pct": round(pixels / n_valid * 100, 2),
+            "area_km2": round(pixels * px_area_km2, 4) if px_area_km2 else None,
+        })
+
+    burned_pixels = int((classes_valid >= 1).sum())  # any class above unburned
+    burned_km2 = round(burned_pixels * px_area_km2, 4) if px_area_km2 else None
+
+    # ── Georeferenced classified severity GeoTIFF ──
+    geotiff_path = crs_out = bounds_wgs84 = None
+    try:
+        out_dir = PROJECT_ROOT / "data" / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        slug = aoi_h[:8] if aoi_h != "full_scene" else "full"
+        tif_path = out_dir / f"{scene_id_b}_burn_{slug}.tif"
+        _write_geotiff(
+            tif_path, class_grid, transform_b, crs_b,
+            dtype="uint8", nodata=255, count=1, colormap=_DNBR_COLORMAP,
+        )
+        geotiff_path = str(tif_path)
+        crs_out = _crs_str(crs_b)
+        bounds_wgs84 = _wgs84_bounds(transform_b, crs_b, min_rows, min_cols)
+    except Exception:  # georeferencing is additive — never fail the analysis on it
+        geotiff_path = crs_out = bounds_wgs84 = None
+
+    date_a = meta_a.get("date") or "?"
+    date_b = meta_b.get("date") or "?"
+    sensor = meta_a.get("sensor") or meta_b.get("sensor") or "?"
+    layer_name = f"Burn dNBR {sensor} {date_a}→{date_b}"
+
+    return {
+        "scene_a": scene_id_a,
+        "scene_b": scene_id_b,
+        "aoi_hash": aoi_h,
+        "mean_dnbr": round(float(np.mean(dnbr_valid)), 6),
+        "valid_pixel_pairs": n_valid,
+        "gsd_m": gsd_m,
+        "classes": classes,
+        "burned_pixels": burned_pixels,
+        "burned_pct": round(burned_pixels / n_valid * 100, 2),
+        "burned_area_km2": burned_km2,
+        "scene_a_meta": meta_a,
+        "scene_b_meta": meta_b,
+        "layer_name": layer_name,
         "geotiff_path": geotiff_path,
         "crs": crs_out,
         "bounds_wgs84": bounds_wgs84,
@@ -635,6 +811,7 @@ def export_png(
 
 # Register tools — same pattern as postgis_server.py
 mcp.tool()(compute_change)
+mcp.tool()(burn_severity)
 mcp.tool()(clip_to_aoi)
 mcp.tool()(flood_extent)
 mcp.tool()(export_png)

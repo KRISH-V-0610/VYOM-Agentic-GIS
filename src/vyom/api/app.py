@@ -12,12 +12,16 @@ The server never needs a live LLM key to start — /health, /events, and /scenes
 one. Only /query requires a key (Groq or Gemini, auto-detected from .env).
 """
 
+import asyncio
+import json
+import threading
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from langchain_core.messages import AIMessage, HumanMessage
 
 from ..config import PROJECT_ROOT, get_db_url, get_env
 from ..agent.orchestrator import VyomAgent
@@ -56,11 +60,25 @@ if ARD_DIR.exists():
 
 
 def get_agent() -> VyomAgent:
-    """Default agent factory — used by tests via app.dependency_overrides."""
+    """Legacy zero-arg agent dependency (kept for import back-compat)."""
     try:
         return VyomAgent()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def get_agent_factory():
+    """Overridable factory dependency for /query.
+
+    Returns a callable ``(max_steps, model) -> VyomAgent`` so per-request max_steps and
+    model still flow through, while tests can inject a scripted agent via
+    ``app.dependency_overrides[get_agent_factory]``. The agent is built lazily inside
+    the endpoint (not at dependency-resolution time), so request-validation failures
+    return 422 without ever touching the LLM backend.
+    """
+    def _make(max_steps: int = 12, model: str | None = None) -> VyomAgent:
+        return VyomAgent(max_steps=max_steps, model=model)
+    return _make
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────────
@@ -192,23 +210,15 @@ def scene_assets(scene_id: str) -> models.SceneAssetsResponse:
 
 
 @app.post("/query", response_model=models.QueryResponse)
-def query(req: models.QueryRequest) -> models.QueryResponse:
-    from ..agent.llm import GeminiBackend, GroqBackend, SarvamBackend
-
-    # Build the backend — Sarvam > Groq > Gemini; per-request model override takes priority.
+def query(req: models.QueryRequest,
+          make_agent=Depends(get_agent_factory)) -> models.QueryResponse:
+    # VyomAgent auto-detects the active backend (Sarvam > Groq > Gemini) via the
+    # LangGraph path; model override is forwarded for per-request model selection.
+    # The factory is overridable in tests (scripted backend).
     try:
-        sarvam_key = get_env("SARVAM_API_KEY")
-        groq_key = get_env("GROQ_API_KEY")
-        if sarvam_key and "<" not in sarvam_key:
-            backend = SarvamBackend(model=req.model)
-        elif groq_key and "<" not in groq_key:
-            backend = GroqBackend(model=req.model)
-        else:
-            backend = GeminiBackend(model=req.model)
+        agent = make_agent(req.max_steps, req.model)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    agent = VyomAgent(backend=backend, max_steps=req.max_steps)
 
     # If the user drew an AOI in QGIS, instruct the agent to use that exact polygon
     # for every spatial tool instead of resolving the event's default bounding box.
@@ -246,6 +256,139 @@ def query(req: models.QueryRequest) -> models.QueryResponse:
     if not req.include_history:
         result = {k: v for k, v in result.items() if k != "history"}
     return models.QueryResponse(**result)
+
+
+@app.post("/query/stream")
+async def query_stream(req: models.QueryRequest) -> StreamingResponse:
+    """POST /query/stream — SSE streaming version of /query.
+
+    Yields Server-Sent Events (text/event-stream):
+      data: {"type":"tool",  "step":N, "name":"...", "result":{...}}
+      data: {"type":"answer","text":"..."}
+      data: {"type":"done",  "answer":"...", "tool_calls":[...], "charts":[...], ...}
+      data: {"type":"error", "message":"..."}
+    """
+    run_query = req.query
+    if req.aoi_geojson and req.aoi_geojson.strip():
+        run_query = (
+            f"{req.query}\n\n[User-drawn area of interest — use this EXACT GeoJSON "
+            f"string as the aoi_geojson argument for check_coverage and all spatial "
+            f"tools; do NOT call get_event_aoi: {req.aoi_geojson.strip()}]"
+        )
+
+    try:
+        agent = VyomAgent(max_steps=req.max_steps, model=req.model)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async def event_gen():
+        from langchain_core.callbacks import BaseCallbackHandler
+
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        class _TokenCallback(BaseCallbackHandler):
+            """Intercepts LLM token stream and sends each token to the SSE queue."""
+            def on_llm_new_token(self, token: str, **_kw) -> None:
+                if token:
+                    asyncio.run_coroutine_threadsafe(
+                        q.put({"type": "token", "text": token}), loop)
+
+        def stream_thread():
+            tool_calls_log = []
+            coverage_checked = False
+            answer = None
+            try:
+                from langgraph.errors import GraphRecursionError
+                initial = {
+                    "messages": [HumanMessage(content=run_query)],
+                    "coverage_checked": False,
+                    "tool_calls_log": [],
+                    "step_count": 0,
+                }
+                try:
+                    for chunk in agent._graph.stream(
+                        initial,
+                        config={
+                            "recursion_limit": agent._recursion_limit,
+                            "callbacks": [_TokenCallback()],
+                        },
+                    ):
+                        if "tools" in chunk:
+                            state = chunk["tools"]
+                            coverage_checked = state.get(
+                                "coverage_checked", coverage_checked)
+                            new_entries = state.get("tool_calls_log", [])
+                            new_count = len(new_entries) - len(tool_calls_log)
+                            for entry in new_entries[-max(new_count, 0):]:
+                                tool_calls_log.append(entry)
+                                asyncio.run_coroutine_threadsafe(
+                                    q.put({
+                                        "type": "tool",
+                                        "step": len(tool_calls_log),
+                                        "name": entry["name"],
+                                        "heavy": entry["heavy"],
+                                        "result": entry["result"],
+                                    }),
+                                    loop,
+                                )
+                        else:
+                            # Answer is emitted by agent (pre-synthesis), respond
+                            # (conversational/refusal) or synthesize (final cleaned
+                            # text). Later nodes overwrite earlier → synthesize wins.
+                            for node_key in ("agent", "respond", "synthesize"):
+                                if node_key not in chunk:
+                                    continue
+                                for msg in chunk[node_key].get("messages", []):
+                                    if (isinstance(msg, AIMessage)
+                                            and not getattr(msg, "tool_calls", None)
+                                            and msg.content):
+                                        answer = msg.content
+                except GraphRecursionError:
+                    pass
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "error", "message": str(exc)}), loop)
+
+            charts = []
+            try:
+                from .charts import render_charts
+                tc_log = [{"step": i + 1, **e}
+                          for i, e in enumerate(tool_calls_log)]
+                charts = render_charts(tc_log, EXPORTS_DIR)
+            except Exception:
+                pass
+            asyncio.run_coroutine_threadsafe(
+                q.put({
+                    "type": "done",
+                    "answer": answer,
+                    "tool_calls": [{"step": i + 1, **e}
+                                   for i, e in enumerate(tool_calls_log)],
+                    "coverage_checked": coverage_checked,
+                    "charts": charts,
+                    "steps": len(tool_calls_log),
+                    "stopped": "answer" if answer else "max_steps",
+                }),
+                loop,
+            )
+
+        threading.Thread(target=stream_thread, daemon=True).start()
+
+        while True:
+            event = await q.get()
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("type") in ("done", "error"):
+                break
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/exports/{filename}")

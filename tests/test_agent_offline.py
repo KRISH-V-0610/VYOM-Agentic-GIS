@@ -315,3 +315,144 @@ class TestOrchestrator:
         agent.run("First query")  # consumes the one step
         with pytest.raises(AssertionError, match="ran out"):
             agent.run("Second query — no steps left")
+
+
+# ── 5-node graph: classify parsing (offline, pure function) ─────────────────────
+
+from vyom.agent import orchestrator as orch  # noqa: E402
+from vyom.agent.prompts import context_hint  # noqa: E402
+
+
+class TestClassifyParsing:
+    def test_clean_json(self):
+        p = orch._parse_classify(
+            '{"intent":"analyze","hazard":"flood","event_key":"kerala_periyar_2018"}')
+        assert p == {"intent": "analyze", "hazard": "flood",
+                     "event_key": "kerala_periyar_2018"}
+
+    def test_json_embedded_in_prose(self):
+        p = orch._parse_classify('Sure: {"intent":"conversational","hazard":""} done')
+        assert p["intent"] == "conversational"
+
+    def test_unknown_intent_defaults_analyze(self):
+        assert orch._parse_classify('{"intent":"banana"}')["intent"] == "analyze"
+
+    def test_garbage_defaults_analyze(self):
+        assert orch._parse_classify("no json at all")["intent"] == "analyze"
+
+    def test_empty_defaults_analyze(self):
+        assert orch._parse_classify("")["intent"] == "analyze"
+
+    def test_keyword_fallback(self):
+        assert orch._parse_classify("clearly out_of_scope")["intent"] == "out_of_scope"
+
+    def test_hazard_and_event_lowercased_stripped(self):
+        p = orch._parse_classify('{"intent":"analyze","hazard":" FLOOD ","event_key":" k "}')
+        assert p["hazard"] == "flood"
+        assert p["event_key"] == "k"
+
+
+class TestIntentRouting:
+    def test_conversational_to_respond(self):
+        assert orch._route_intent({"intent": "conversational"}) == "respond"
+
+    def test_out_of_scope_to_respond(self):
+        assert orch._route_intent({"intent": "out_of_scope"}) == "respond"
+
+    def test_analyze_to_agent(self):
+        assert orch._route_intent({"intent": "analyze"}) == "agent"
+
+    def test_discover_to_agent(self):
+        assert orch._route_intent({"intent": "discover"}) == "agent"
+
+
+class TestAgentRouting:
+    def test_tool_calls_route_to_tools(self):
+        from langchain_core.messages import AIMessage
+        msg = AIMessage(content="", tool_calls=[
+            {"name": "list_events", "args": {}, "id": "1"}])
+        assert orch._route_agent({"messages": [msg]}) == "tools"
+
+    def test_no_tool_calls_route_to_synthesize(self):
+        from langchain_core.messages import AIMessage
+        assert orch._route_agent({"messages": [AIMessage(content="done")]}) == "synthesize"
+
+
+class TestCleanAnswer:
+    def test_strips_next_steps_line(self):
+        out = orch._clean_answer("Water rose 5%.\nNext steps: do X")
+        assert "Next steps" not in out and "Water rose 5%." in out
+
+    def test_strips_let_me_know(self):
+        out = orch._clean_answer("Done.\nLet me know if you want more.")
+        assert "Let me know" not in out
+
+    def test_strips_bulleted_boilerplate(self):
+        out = orch._clean_answer("Result.\n- If you'd like, I can run more.")
+        assert "If you'd like" not in out and "Result." in out
+
+    def test_keeps_data_lines(self):
+        out = orch._clean_answer("- pre: 13.2%\n- event: 0.3%")
+        assert "13.2%" in out and "0.3%" in out
+
+    def test_empty_in_empty_out(self):
+        assert orch._clean_answer("") == ""
+        assert orch._clean_answer(None) == ""
+
+
+class TestFallbackAnswer:
+    def test_no_tools_message(self):
+        out = orch._fallback_answer([]).lower()
+        assert "couldn't complete" in out or "rephras" in out
+
+    def test_lists_distinct_tools_run(self):
+        out = orch._fallback_answer([
+            {"name": "check_coverage"}, {"name": "flood_extent"},
+            {"name": "check_coverage"}])
+        assert "check_coverage" in out and "flood_extent" in out
+        assert out.count("check_coverage") == 1  # de-duplicated
+
+
+class TestContextHint:
+    def test_flood_hint(self):
+        h = context_hint("analyze", "flood", "kerala_periyar_2018")
+        assert "water_area_pct" in h and "kerala_periyar_2018" in h
+
+    def test_wildfire_hint_mentions_burn(self):
+        assert "burn_severity" in context_hint("analyze", "wildfire", "")
+
+    def test_drought_hint_is_ndvi_not_vci(self):
+        h = context_hint("analyze", "drought", "")
+        assert "ndvi_mean" in h and "VCI" in h  # explicitly says NOT VCI
+
+    def test_landslide_hint(self):
+        assert "compute_change" in context_hint("analyze", "landslide", "")
+
+    def test_discover_hint_catalog(self):
+        assert "catalog" in context_hint("discover", "", "").lower()
+
+    def test_empty_when_no_signal(self):
+        assert context_hint("analyze", "", "") == ""
+
+
+class TestNewToolsRegistered:
+    def test_new_tools_in_registry(self):
+        for name in ("burn_severity", "compare_events", "find_best_scene",
+                     "find_scene_pairs"):
+            assert name in tools.REGISTRY
+
+    def test_burn_severity_is_heavy(self):
+        assert "burn_severity" in tools.HEAVY_TOOLS
+
+    def test_catalog_tools_not_heavy(self):
+        assert "compare_events" not in tools.HEAVY_TOOLS
+        assert "find_best_scene" not in tools.HEAVY_TOOLS
+        assert "find_scene_pairs" not in tools.HEAVY_TOOLS
+
+    def test_registry_has_fifteen_tools(self):
+        assert len(tools.REGISTRY) == 15
+
+    def test_compare_events_empty_list_no_db(self):
+        # Early-returns before any DB connection — safe to run offline.
+        r = tools.REGISTRY["compare_events"]([], "water_area_pct")
+        assert r["events"] == [] and r["ranking"] == []

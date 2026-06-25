@@ -108,9 +108,12 @@ _AOI_STR = {
 DECLARATIONS = [
     {
         "name": "list_events",
-        "description": "List all disaster events registered in VYOM (key, hazard type, "
-                       "AOI bbox, date, primary index). Call this to discover what "
-                       "events exist when the user names a place/disaster.",
+        "description": (
+            "List all disaster events registered in VYOM (key, hazard type, "
+            "AOI bbox, date, primary index). Call this to discover what "
+            "events exist when the user names a place/disaster. "
+            "No arguments needed — call with empty args {}."
+        ),
         "parameters": {"type": "OBJECT", "properties": {}},
     },
     {
@@ -202,6 +205,73 @@ DECLARATIONS = [
         },
     },
     {
+        "name": "find_scene_pairs",
+        "description": (
+            "Find scene pairs that physically overlap between two temporal windows "
+            "(e.g. pre_event vs post_event). CALL THIS before compute_change to get "
+            "scene IDs that are guaranteed to share valid pixels. Pairs are ranked by "
+            "lowest combined cloud cover. Returns best_pair for convenience. "
+            "If no same-sensor pairs exist the note field explains why and suggests "
+            "falling back to compare_windows."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "event_key": {"type": "STRING"},
+                "window_a": {"type": "STRING",
+                             "description": "First window — default pre_event."},
+                "window_b": {"type": "STRING",
+                             "description": "Second window — default post_event."},
+                "same_sensor": {"type": "BOOLEAN",
+                                "description": "Require same sensor (default true). "
+                                               "Set false only if no same-sensor pairs exist."},
+                "aoi_geojson": _AOI_STR,
+                "limit": {"type": "INTEGER", "description": "Max pairs (default 5)."},
+            },
+            "required": ["event_key"],
+        },
+    },
+    {
+        "name": "compare_events",
+        "description": (
+            "Rank MULTIPLE events by one cached metric in a window — the cross-event "
+            "tool. Use for 'which flood was worse, 2019 or 2022 Assam?'. One call "
+            "instead of several compare_windows. Returns events ranked by mean + a "
+            "ranking list + interpretation."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "event_keys": {"type": "ARRAY", "items": {"type": "STRING"},
+                               "description": "Two or more registered event keys."},
+                "metric": {"type": "STRING",
+                           "description": "Cached metric, e.g. water_area_pct, ndvi_mean."},
+                "window": {"type": "STRING",
+                           "description": "Window to evaluate per event (default event)."},
+            },
+            "required": ["event_keys", "metric"],
+        },
+    },
+    {
+        "name": "find_best_scene",
+        "description": (
+            "Pick the single lowest-cloud scene in an event/window — single-scene "
+            "selector. Use BEFORE flood_extent / export_png / burn_severity to choose "
+            "a clean target scene instead of guessing from list_scenes."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "event_key": {"type": "STRING"},
+                "window_type": {"type": "STRING",
+                                "description": "pre_event | event | post_event | annual"},
+                "sensor": {"type": "STRING", "description": "LISS3 | LISS4 | AWiFS"},
+                "max_cloud": {"type": "NUMBER", "description": "Optional cloud_cover cap."},
+            },
+            "required": ["event_key"],
+        },
+    },
+    {
         "name": "compute_change",
         "description": "Pixel-wise index change between two scenes (delta = B − A). "
                        "HEAVY: reads rasters. Use for direct two-scene comparison "
@@ -215,6 +285,25 @@ DECLARATIONS = [
                 "aoi_geojson": _AOI_STR,
             },
             "required": ["scene_id_a", "scene_id_b", "index"],
+        },
+    },
+    {
+        "name": "burn_severity",
+        "description": (
+            "Classified burn-severity map from dNBR between a PRE-fire and POST-fire "
+            "scene — the primary WILDFIRE tool (analog of flood_extent). Returns burned "
+            "area per USGS severity class (unburned/low/moderate_low/moderate_high/high) "
+            "+ total burned km² + a styled GeoTIFF. HEAVY: reads rasters. Requires NBR "
+            "(SWIR) — works on LISS3/AWiFS, NOT LISS4. Pair scenes with find_scene_pairs."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "scene_id_a": {"type": "STRING", "description": "PRE-fire baseline scene."},
+                "scene_id_b": {"type": "STRING", "description": "POST-fire scene."},
+                "aoi_geojson": _AOI_STR,
+            },
+            "required": ["scene_id_a", "scene_id_b"],
         },
     },
     {
@@ -274,34 +363,68 @@ REGISTRY = {
     "get_scene_metrics": pg.get_scene_metrics,
     "scenes_by_date_range": pg.scenes_by_date_range,
     "compare_windows": pg.compare_windows,
+    "find_scene_pairs": pg.find_scene_pairs,
+    "compare_events": pg.compare_events,
+    "find_best_scene": pg.find_best_scene,
     "compute_change": gis.compute_change,
+    "burn_severity": gis.burn_severity,
     "clip_to_aoi": gis.clip_to_aoi,
     "flood_extent": gis.flood_extent,
     "export_png": gis.export_png,
 }
 
 # Tools that read pixels (slow) — surfaced to the orchestrator for logging/telemetry.
-HEAVY_TOOLS = {"compute_change", "clip_to_aoi", "flood_extent", "export_png"}
+HEAVY_TOOLS = {"compute_change", "burn_severity", "clip_to_aoi", "flood_extent", "export_png"}
+
+# Stamp additionalProperties:false on every declaration so strict-mode APIs
+# (and models that respect the schema) know extra keys are not allowed.
+for _d in DECLARATIONS:
+    _p = _d.get("parameters")
+    if isinstance(_p, dict):
+        _p["additionalProperties"] = False
 
 # Params that arrive as JSON strings from Gemini and must be parsed to dicts.
 _JSON_PARAMS = {"aoi_geojson"}
+
+# Schema-aware whitelist: tool_name -> set of declared parameter names.
+# Built once at import time from DECLARATIONS so coerce_args can silently drop
+# any arg the tool never declared (phantom keys, hallucinated names, empty-string
+# keys from no-arg tools) without raising — eliminating unnecessary retries.
+_DECLARED_PARAMS: dict[str, set[str]] = {
+    decl["name"]: set((decl.get("parameters") or {}).get("properties") or {})
+    for decl in DECLARATIONS
+}
 
 
 def coerce_args(name: str, args: dict) -> dict:
     """Normalise model-supplied args before dispatch.
 
+    - Drop undeclared args (phantom keys, hallucinated names, LLM quirks like
+      {"": {}}) — silently, so no retry is needed.
+    - Drop null / empty-string values so Python defaults apply.
     - JSON-string GeoJSON params -> dict.
-    - Drop null/empty-string optional args so Python defaults apply.
     """
+    declared = _DECLARED_PARAMS.get(name)  # None only for unknown tools
     out = {}
     for k, v in (args or {}).items():
-        if v is None or v == "":
+        # Drop empty-string keys and null/empty values.
+        if not k or v is None or v == "":
+            continue
+        # Drop args the tool never declared (hallucinated / phantom params).
+        if declared is not None and k not in declared:
             continue
         if k in _JSON_PARAMS and isinstance(v, str):
-            try:
-                v = json.loads(v)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{name}: {k} is not valid JSON GeoJSON: {exc}") from exc
+            parsed = None
+            # LLMs sometimes add stray trailing braces — try progressive stripping.
+            for attempt in (v, v.rstrip("}") + "}", v.rstrip("}")):
+                try:
+                    parsed = json.loads(attempt)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if parsed is None:
+                raise ValueError(f"{name}: {k} is not valid JSON GeoJSON")
+            v = parsed
         out[k] = v
     return out
 

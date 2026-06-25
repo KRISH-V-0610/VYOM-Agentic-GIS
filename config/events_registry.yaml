@@ -1,7 +1,7 @@
 events:
   - key: kerala_periyar_2018
     hazard_type: flood
-    display_name: "Kerala floods 2018 — Periyar & Ernakulam basin"
+    display_name: "Kerala floods 2018 -Periyar & Ernakulam basin"
     bbox: [76.0, 9.5, 77.5, 11.0]
     event_date: "2018-08-15"
     primary_index: NDWI
@@ -10,7 +10,7 @@ events:
 
   - key: assam_brahmaputra_2022
     hazard_type: flood
-    display_name: "Assam floods 2022 — Brahmaputra & Barak basins"
+    display_name: "Assam floods 2022 -Brahmaputra & Barak basins"
     bbox: [89.5, 24.0, 93.5, 26.5]
     event_date: "2022-06-20"
     primary_index: NDWI
@@ -19,7 +19,7 @@ events:
 
   - key: bihar_kosi_ganga_2019
     hazard_type: flood
-    display_name: "Bihar floods 2019 — Ganga, Kosi, Gandak plains"
+    display_name: "Bihar floods 2019 -Ganga, Kosi, Gandak plains"
     bbox: [84.5, 25.0, 87.5, 27.0]
     event_date: "2019-09-28"
     primary_index: NDWI
@@ -28,7 +28,7 @@ events:
 
   - key: wildfire_uttarakhand_2016
     hazard_type: wildfire
-    display_name: "Uttarakhand forest fires 2016 — burn scar mapping"
+    display_name: "Uttarakhand forest fires 2016 -burn scar mapping"
     bbox: [78.5, 29.3, 80.2, 30.5]
     event_date: "2016-04-29"
     primary_index: NBR
@@ -49,6 +49,10 @@ events:
     display_name: "Marathwada agricultural drought 2015-16"
     bbox: [75.0, 17.5, 78.5, 20.2]
     event_date: "2015-10-15"
-    primary_index: VCI
-    ground_truth: "IMD drought declaration + VCI baseline"
+    # True VCI needs a multi-year per-pixel NDVI min/max climatology, which is not
+    # ingested (only 2013/2015/2016). Assessed instead as an NDVI anomaly across the
+    # year-windows: pre_event=2013 (healthy baseline), event=2015 (drought),
+    # post_event=2016 (recovery). Reported as NDVI-based vegetation stress, not VCI.
+    primary_index: NDVI-anomaly
+    ground_truth: "IMD drought declaration (NDVI anomaly vs 2013 baseline year)"
     manifest: data/manifests/drought_marathwada_2016.csv

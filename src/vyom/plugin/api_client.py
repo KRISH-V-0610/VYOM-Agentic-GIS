@@ -125,6 +125,52 @@ class VyomApiClient:
             body["aoi_geojson"] = aoi_geojson
         return json.loads(self._request("POST", "/query", body=body).decode("utf-8"))
 
+    def query_stream(self, question: str, max_steps: int = 12,
+                     aoi_geojson: str = None, on_event=None) -> dict:
+        """POST /query/stream — SSE streaming endpoint.
+
+        Calls ``on_event(event_dict)`` for each SSE event as it arrives.
+        Blocks until the stream closes; returns the final ``done`` event dict.
+        Falls back gracefully if the server doesn't support streaming.
+        """
+        body = {"query": question, "max_steps": max_steps, "include_history": False}
+        if aoi_geojson:
+            body["aoi_geojson"] = aoi_geojson
+        data = json.dumps(body).encode("utf-8")
+        url = self.base_url + "/query/stream"
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json",
+                     "Accept": "text/event-stream"},
+            method="POST",
+        )
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        event = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    if on_event:
+                        on_event(event)
+                    if event.get("type") in ("done", "error"):
+                        return event
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # Server doesn't have the streaming endpoint yet — fall back.
+                return self.query(question, max_steps, False, aoi_geojson)
+            detail = self._extract_detail(exc)
+            raise VyomApiError(f"{exc.code} {exc.reason}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise VyomApiError(
+                f"Cannot reach VYOM API at {self.base_url} — is it running? "
+                f"[{exc.reason}]"
+            ) from exc
+        return {}
+
     def download_export(self, filename: str, dest_dir=None) -> str:
         """GET /exports/{filename} — fetch a PNG to a local file, return its path.
 
@@ -138,6 +184,99 @@ class VyomApiClient:
         with open(out_path, "wb") as fh:
             fh.write(data)
         return out_path
+
+
+def best_preprocessed_layer(query_result: dict, base_url: str) -> dict | None:
+    """Return a vsicurl layer descriptor for the primary-index COG of the best scene.
+
+    Used when no raster tool was called (catalog-only answer like compare_windows)
+    so the map is never empty. Extracts the event_key from tool_call args, then
+    the best scene_id from find_best_scene results (or compare_windows results).
+    Returns None if no usable scene can be resolved.
+
+    The returned dict has the same shape as georef_layers() entries so the same
+    layer-addition code can handle both paths.
+    """
+    tool_calls = query_result.get("tool_calls") or []
+
+    # 1. Collect event_key and any explicit scene_id from the tool trace.
+    event_key = None
+    window = "event"
+    scene_id = None
+    primary_index = None
+
+    for call in tool_calls:
+        name = call.get("name", "")
+        args = call.get("args") or {}
+        result = call.get("result") or {}
+
+        if name in ("compare_windows", "compare_events"):
+            event_key = event_key or args.get("event_key") or (
+                (args.get("event_keys") or [None])[0])
+
+        if name == "get_event_aoi":
+            event_key = event_key or result.get("event_key")
+            primary_index = primary_index or result.get("primary_index", "").lower()
+
+        if name == "find_best_scene" and result.get("found"):
+            scene = result.get("scene") or {}
+            scene_id = scene.get("id")
+            event_key = event_key or scene.get("event_key")
+
+    if not event_key:
+        return None
+
+    # 2. If no scene_id yet, pick the best from find_best_scene result or list.
+    if not scene_id:
+        for call in tool_calls:
+            if call.get("name") == "find_best_scene":
+                sc = (call.get("result") or {}).get("scene") or {}
+                scene_id = sc.get("id")
+                break
+
+    if not scene_id:
+        return None
+
+    # 3. Build the asset URL for the primary index COG via /scenes/{id}/assets.
+    index_key = primary_index or "ndwi"
+    # Map registry primary_index labels to asset keys.
+    _INDEX_MAP = {
+        "ndwi": "ndwi", "nbr": "nbr", "ndvi": "ndvi",
+        "mndwi": "mndwi", "ndvi-anomaly": "ndvi", "dnbr": "nbr", "dndvi": "ndvi",
+    }
+    asset_key = _INDEX_MAP.get(index_key, "ndwi")
+
+    try:
+        url = base_url.rstrip("/") + f"/scenes/{urllib.parse.quote(scene_id)}/assets"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    assets = data.get("assets") or {}
+    asset_url = assets.get(asset_key) or assets.get("ndwi") or assets.get("ndvi")
+    if not asset_url:
+        return None
+
+    bbox = data.get("bbox_wgs84")  # [minlon, minlat, maxlon, maxlat]
+    sensor = data.get("sensor") or ""
+    acq = (data.get("acq_datetime") or "")[:10]
+    layer_name = f"{asset_key.upper()} {sensor} {acq} (preprocessed)"
+
+    # Build vsicurl URL for streaming the COG without downloading everything.
+    vsicurl = "/vsicurl/" + base_url.rstrip("/") + asset_url
+
+    return {
+        "filename": None,              # signals vsicurl path, not a download
+        "vsicurl_path": vsicurl,
+        "crs": "EPSG:4326",
+        "bounds_wgs84": bbox,
+        "kind": ("flood" if asset_key == "ndwi" else
+                 "burn"  if asset_key == "nbr"  else "index"),
+        "layer_name": layer_name,
+    }
 
 
 def export_filenames(query_result: dict) -> list:
@@ -164,6 +303,8 @@ def _kind_for(call_name: str, result: dict) -> str:
     """Classify a georeferenced result into a styling kind for the QGIS renderer."""
     if call_name == "flood_extent":
         return "flood"
+    if call_name == "burn_severity":
+        return "burn"
     if call_name == "compute_change":
         return "change"
     if call_name == "export_png":
@@ -175,11 +316,18 @@ def georef_layers(query_result: dict) -> list:
     """Extract georeferenced raster layers from a /query result's tool_calls.
 
     Any tool result carrying a ``geotiff_path`` (flood_extent, compute_change,
-    export_png after Phase 6) becomes a layer descriptor:
+    export_png) becomes a layer descriptor:
 
-        {"filename": str, "crs": str|None, "bounds_wgs84": list|None, "kind": str}
+        {
+          "filename": str,
+          "crs": str|None,
+          "bounds_wgs84": list|None,
+          "kind": str,            # "rgb" | "flood" | "index" | "change"
+          "layer_name": str,      # human-readable QGIS panel name
+        }
 
-    ``kind`` ∈ {"rgb", "flood", "index", "change"} drives QGIS styling.
+    For compute_change the layer_name is "Δ{INDEX} {SENSOR} {date_a}→{date_b}",
+    built from scene_a_meta / scene_b_meta that compute_change now returns.
     """
     layers = []
     for call in query_result.get("tool_calls") or []:
@@ -189,11 +337,20 @@ def georef_layers(query_result: dict) -> list:
         path = result.get("geotiff_path")
         if not path:
             continue
+        kind = _kind_for(call.get("name"), result)
+
+        # Prefer an explicit layer_name from the tool; fall back to a filename stem.
+        layer_name = result.get("layer_name")
+        if not layer_name:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            layer_name = stem[:40]
+
         layers.append({
             "filename": os.path.basename(path),
             "crs": result.get("crs"),
             "bounds_wgs84": result.get("bounds_wgs84"),
-            "kind": _kind_for(call.get("name"), result),
+            "kind": kind,
+            "layer_name": layer_name,
         })
     return layers
 
@@ -314,6 +471,12 @@ _LAYER_EXPLANATIONS = {
         "<b>Red</b> = index decreased (water receded / land exposed / vegetation lost). "
         "White = no change. Large blue patches after a flood show where water spread.",
     ),
+    "burn": (
+        "🗺️ Burn-severity layer added to the map",
+        "USGS dNBR classes — pale <b>yellow</b> = low severity, <b>orange</b> = "
+        "moderate, deep <b>red</b> = high severity (most biomass lost). Transparent = "
+        "unburned. The coloured extent is the fire-affected area on this date.",
+    ),
     "index": (
         "🗺️ Index layer added to the map",
         "Color scale: deep <b>blue</b> (+1) = open water; <b>yellow</b> (0) = "
@@ -359,21 +522,58 @@ def _max_cloud_in(query_result: dict):
     return max(clouds) if clouds else None
 
 
+# Tools that make data claims — confidence only applies when at least one ran.
+_DATA_TOOLS = {
+    "compare_windows", "list_scenes", "get_scene_metrics", "scenes_by_date_range",
+    "flood_extent", "compute_change", "clip_to_aoi", "export_png",
+}
+
+
 def confidence_badge(query_result: dict):
     """Classify an answer's trustworthiness into (level, color, reason).
 
-    level ∈ {"high","medium","low"}; color is a hex string for the UI dot.
-    Heuristic: coverage must be checked; high cloud cover degrades confidence.
+    Returns None when no data tools ran (e.g. greeting / conversational reply) —
+    the caller should skip the badge entirely in that case.
+
+    When data tools did run, returns (level, color, reason):
+      level ∈ {"high","medium","low"};  color is a hex CSS string.
     """
+    tool_calls = query_result.get("tool_calls") or []
+
+    # No data tools ran → this is a conversational reply, no badge needed.
+    data_calls = [c for c in tool_calls if c.get("name") in _DATA_TOOLS]
+    if not data_calls:
+        return None
+
+    # At least one data tool ran — evaluate quality.
     if not query_result.get("coverage_checked"):
         return ("low", "#c0392b",
                 "Coverage was not verified — treat this answer with caution.")
-    # Any tool that errored lowers confidence.
-    for call in query_result.get("tool_calls") or []:
+
+    for call in data_calls:
         res = call.get("result")
         if isinstance(res, dict) and "error" in res:
             return ("medium", "#e67e22",
                     "A tool returned an error; the answer may be partial.")
+
+    # Spatial overlap quality from find_scene_pairs degrades confidence.
+    for call in (query_result.get("tool_calls") or []):
+        if call.get("name") == "find_scene_pairs":
+            best = (call.get("result") or {}).get("best_pair") or {}
+            quality = best.get("overlap_quality")
+            pct = best.get("overlap_pct")
+            if quality == "poor":
+                pct_str = f"{pct:.0f}%" if pct is not None else "very little"
+                return ("low", "#c0392b",
+                        f"Scene overlap covers only {pct_str} of the AOI — "
+                        f"change map is based on a small fraction of your area.")
+            if quality == "moderate":
+                pct_str = f"{pct:.0f}%" if pct is not None else "partial"
+                return ("medium", "#e67e22",
+                        f"Scene overlap covers {pct_str} of the AOI — "
+                        f"results are representative but not complete.")
+            break  # "good" overlap — fall through to cloud check
+
     cloud = _max_cloud_in(query_result)
     if cloud is not None and cloud >= 50:
         return ("low", "#c0392b",
@@ -382,7 +582,7 @@ def confidence_badge(query_result: dict):
         return ("medium", "#e67e22",
                 f"Moderate cloud cover (~{cloud:.0f}%) — interpret with some caution.")
     return ("high", "#27ae60",
-            "Coverage verified and cloud cover low — answer is well grounded.")
+            "Coverage verified, cloud cover low, and scene overlap good.")
 
 
 # ── Query templates per hazard type ─────────────────────────────────────────────

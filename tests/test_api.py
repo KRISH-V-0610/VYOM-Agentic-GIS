@@ -14,7 +14,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from vyom.api.app import app, get_agent
+from vyom.api.app import app, get_agent_factory
 from vyom.agent.llm import ScriptedBackend
 from vyom.agent.orchestrator import VyomAgent
 
@@ -33,9 +33,14 @@ def client():
 
 @pytest.fixture
 def client_with_agent(client):
-    """Fixture that yields (client, override-setter) for /query tests."""
-    def _set(agent_factory):
-        app.dependency_overrides[get_agent] = agent_factory
+    """Fixture that yields (client, override-setter) for /query tests.
+
+    The test passes a zero-arg callable returning a (scripted) VyomAgent; we adapt it
+    to the factory signature ``(max_steps, model) -> agent`` that /query expects.
+    """
+    def _set(agent_zero_arg):
+        app.dependency_overrides[get_agent_factory] = (
+            lambda: (lambda max_steps=12, model=None: agent_zero_arg()))
 
     yield client, _set
     app.dependency_overrides.clear()
@@ -54,8 +59,9 @@ class TestHealth:
         assert body["status"] in ("ok", "degraded")
         assert "db_ok" in body
         assert isinstance(body["db_ok"], bool)
-        assert "gemini_key_configured" in body
-        assert isinstance(body["gemini_key_configured"], bool)
+        assert "llm_key_configured" in body
+        assert isinstance(body["llm_key_configured"], bool)
+        assert "llm_provider" in body
 
     def test_detail_present_when_db_down(self, client):
         body = client.get("/health").json()

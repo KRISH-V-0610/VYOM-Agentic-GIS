@@ -445,6 +445,319 @@ def _interpret_delta(metric: str, baseline: str, deltas: dict) -> str:
     return f"{metric} {direction} by {abs(val)} from {baseline} ({key})."
 
 
+# ── TOOL: find_scene_pairs ────────────────────────────────────────────────────────
+
+
+def find_scene_pairs(
+    event_key: str,
+    window_a: str = "pre_event",
+    window_b: str = "post_event",
+    same_sensor: bool = True,
+    aoi_geojson: dict = None,
+    limit: int = 5,
+) -> dict:
+    """Find scene pairs that physically overlap between two temporal windows.
+
+    Call this BEFORE compute_change to guarantee the two scene IDs you pick will
+    actually share valid pixels. Pairs are ranked by lowest combined cloud cover
+    (best first), then by largest overlap area.
+
+    Args:
+        event_key: event to search (e.g. 'kerala_periyar_2018').
+        window_a: first window — usually 'pre_event' or 'event'.
+        window_b: second window — usually 'post_event' or 'event'.
+        same_sensor: if True (default) only return pairs from the same sensor
+            (LISS3↔LISS3 or LISS4↔LISS4). Pixel-wise change maps require this.
+        aoi_geojson: optional AOI; pairs must intersect both the AOI and each other.
+        limit: max pairs to return (default 5).
+
+    Returns:
+        {
+          "count": int,
+          "pairs": [{
+            "scene_a_id": str, "scene_b_id": str, "sensor": str,
+            "date_a": str, "date_b": str,
+            "cloud_a": float, "cloud_b": float, "combined_cloud": float,
+            "overlap_km2": float
+          }, ...],
+          "best_pair": {"scene_a_id": str, "scene_b_id": str} | null,
+          "note": str   # set when no pairs found with same_sensor=True
+        }
+    """
+    join_extra = "AND a.sensor = b.sensor" if same_sensor else ""
+
+    aoi_clause = ""
+    aoi_params: list = []
+    if aoi_geojson is not None:
+        geom = _to_geometry(aoi_geojson)
+        geom_json = json.dumps(geom)
+        aoi_clause = (
+            "AND ST_Intersects(a.geometry, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326))"
+            " AND ST_Intersects(b.geometry, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326))"
+        )
+        aoi_params = [geom_json, geom_json]
+
+    sql = f"""
+        SELECT
+            a.id                                                   AS scene_a_id,
+            b.id                                                   AS scene_b_id,
+            a.sensor                                               AS sensor,
+            a.acq_datetime::date                                   AS date_a,
+            b.acq_datetime::date                                   AS date_b,
+            COALESCE(a.cloud_cover, 100)                           AS cloud_a,
+            COALESCE(b.cloud_cover, 100)                           AS cloud_b,
+            COALESCE(a.cloud_cover, 100) + COALESCE(b.cloud_cover, 100)
+                                                                   AS combined_cloud,
+            ROUND(
+                ST_Area(ST_Intersection(a.geometry, b.geometry)::geography) / 1e6
+            )                                                      AS overlap_km2
+        FROM scenes a
+        JOIN scenes b ON (
+            b.event_key = %s
+            AND b.window_type = %s
+            AND ST_Intersects(a.geometry, b.geometry)
+            {join_extra}
+        )
+        WHERE a.event_key = %s
+          AND a.window_type = %s
+          {aoi_clause}
+        ORDER BY combined_cloud ASC, overlap_km2 DESC
+        LIMIT %s
+    """
+    # Param order must match %s positions in SQL:
+    # JOIN b.event_key, b.window_type → WHERE a.event_key, a.window_type → aoi × 2 → limit
+    params = [event_key, window_b, event_key, window_a] + aoi_params + [int(limit)]
+
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+
+        # AOI area for overlap fraction — single extra query, only when AOI supplied.
+        aoi_area_km2 = None
+        if aoi_geojson is not None and rows:
+            geom_json = json.dumps(_to_geometry(aoi_geojson))
+            cur.execute(
+                "SELECT ST_Area(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)::geography)/1e6",
+                (geom_json,),
+            )
+            aoi_area_km2 = float(cur.fetchone()[0])
+
+    pairs = []
+    for row in rows:
+        r = dict(zip(cols, row))
+        for f in ("date_a", "date_b"):
+            if r.get(f) is not None:
+                r[f] = r[f].isoformat()
+        for f in ("cloud_a", "cloud_b", "combined_cloud", "overlap_km2"):
+            if r.get(f) is not None:
+                r[f] = float(r[f])
+
+        # Overlap fraction + quality label.
+        okm2 = r.get("overlap_km2")
+        if okm2 is not None and aoi_area_km2 and aoi_area_km2 > 0:
+            frac = min(okm2 / aoi_area_km2, 1.0)
+            r["aoi_area_km2"] = round(aoi_area_km2, 1)
+            r["overlap_pct"] = round(frac * 100, 1)
+            r["overlap_quality"] = (
+                "good" if frac >= 0.5 else "moderate" if frac >= 0.2 else "poor"
+            )
+        else:
+            r["overlap_pct"] = None
+            r["overlap_quality"] = None
+
+        pairs.append(r)
+
+    note = None
+    if not pairs and same_sensor:
+        note = (
+            f"No same-sensor overlapping pairs found between {window_a} and {window_b} "
+            f"for {event_key}. Try same_sensor=false to allow cross-sensor pairs "
+            f"(note: cross-sensor pixel change maps are unreliable due to GSD mismatch)."
+        )
+
+    best = pairs[0] if pairs else None
+    return {
+        "count": len(pairs),
+        "pairs": pairs,
+        "best_pair": (
+            {
+                "scene_a_id": best["scene_a_id"],
+                "scene_b_id": best["scene_b_id"],
+                "sensor": best["sensor"],
+                "date_a": best["date_a"],
+                "date_b": best["date_b"],
+                "cloud_a": best["cloud_a"],
+                "cloud_b": best["cloud_b"],
+                "overlap_km2": best["overlap_km2"],
+                "overlap_pct": best["overlap_pct"],
+                "overlap_quality": best["overlap_quality"],
+            }
+            if best else None
+        ),
+        "note": note,
+    }
+
+
+# ── TOOL: compare_events ──────────────────────────────────────────────────────────
+
+
+def compare_events(
+    event_keys: list,
+    metric: str,
+    window: str = "event",
+) -> dict:
+    """Rank multiple events by one cached metric in a chosen window — cross-event compare.
+
+    Answers "which flood was worse, 2019 or 2022 Assam?" in a single deterministic call
+    instead of the agent juggling several compare_windows results. Uses full-scene
+    cached metrics (aoi_hash='full_scene').
+
+    Args:
+        event_keys: events to compare (e.g. ['assam_brahmaputra_2019',
+            'assam_brahmaputra_2022']).
+        metric: cached metric to rank on (e.g. 'water_area_pct', 'ndvi_mean').
+        window: window to evaluate per event (default 'event'); e.g. 'event',
+            'post_event', 'pre_event'.
+
+    Returns:
+        {
+          "metric": str, "window": str,
+          "events": [{"event_key", "mean", "min", "max", "scene_count"} ...]  # ranked desc by mean
+          "ranking": [event_key, ...],   # highest mean first
+          "interpretation": str
+        }
+        Events with no cached data for that metric/window are returned with null stats.
+    """
+    if not event_keys:
+        return {"metric": metric, "window": window, "events": [], "ranking": [],
+                "interpretation": "No event_keys supplied."}
+
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.event_key,
+                   AVG(m.value), MIN(m.value), MAX(m.value), COUNT(*)
+            FROM scene_metrics m
+            JOIN scenes s ON s.id = m.scene_id
+            WHERE s.event_key = ANY(%s)
+              AND m.metric = %s
+              AND m.aoi_hash = 'full_scene'
+              AND s.window_type = %s
+            GROUP BY s.event_key
+            """,
+            (list(event_keys), metric, window),
+        )
+        agg = {
+            ek: {
+                "mean": round(float(avg), 6),
+                "min": round(float(mn), 6),
+                "max": round(float(mx), 6),
+                "scene_count": int(n),
+            }
+            for ek, avg, mn, mx, n in cur.fetchall()
+        }
+
+    # Preserve every requested event; null stats where no data was cached.
+    events = []
+    for ek in event_keys:
+        stats = agg.get(ek)
+        events.append({"event_key": ek, **(stats or {
+            "mean": None, "min": None, "max": None, "scene_count": 0})})
+
+    # Rank by mean (events with data only), highest first.
+    with_data = [e for e in events if e["mean"] is not None]
+    with_data.sort(key=lambda e: e["mean"], reverse=True)
+    events_sorted = with_data + [e for e in events if e["mean"] is None]
+    ranking = [e["event_key"] for e in with_data]
+
+    if not with_data:
+        interp = f"No cached '{metric}' data in the '{window}' window for these events."
+    elif len(with_data) == 1:
+        interp = (f"Only {with_data[0]['event_key']} has cached '{metric}' data "
+                  f"(mean {with_data[0]['mean']}) in the '{window}' window.")
+    else:
+        top, bottom = with_data[0], with_data[-1]
+        interp = (f"{top['event_key']} has the highest {metric} "
+                  f"({top['mean']}) and {bottom['event_key']} the lowest "
+                  f"({bottom['mean']}) in the '{window}' window.")
+
+    return {
+        "metric": metric,
+        "window": window,
+        "events": events_sorted,
+        "ranking": ranking,
+        "interpretation": interp,
+    }
+
+
+# ── TOOL: find_best_scene ───────────────────────────────────────────────────────
+
+
+def find_best_scene(
+    event_key: str,
+    window_type: str = None,
+    sensor: str = None,
+    max_cloud: float = None,
+) -> dict:
+    """Pick the single lowest-cloud scene in an event/window — single-scene selector.
+
+    The single-scene analog of find_scene_pairs. Use it to choose a concrete target
+    scene for flood_extent / export_png / burn_severity instead of guessing from a
+    list_scenes dump.
+
+    Args:
+        event_key: event to search (e.g. 'kerala_periyar_2018').
+        window_type: optional window filter ('pre_event'|'event'|'post_event'|'annual').
+        sensor: optional sensor filter ('LISS3'|'LISS4'|'AWiFS').
+        max_cloud: optional cap on cloud_cover percent.
+
+    Returns:
+        {"found": bool, "scene": {id, sensor, satellite, acq_datetime, cloud_cover,
+         gsd_m, window_type, available_assets} | null, "note": str|None}
+        The chosen scene has the lowest cloud_cover (NULLs sorted last), ties broken
+        by most recent acquisition.
+    """
+    cols = [
+        "id", "collection", "satellite", "sensor", "acq_datetime", "cloud_cover",
+        "gsd_m", "event_key", "window_type", "processing_level", "pipeline_version",
+        "assets",
+    ]
+    where, params = ["event_key = %s"], [event_key]
+    if window_type:
+        where.append("window_type = %s")
+        params.append(window_type)
+    if sensor:
+        where.append("sensor = %s")
+        params.append(sensor)
+    if max_cloud is not None:
+        where.append("cloud_cover <= %s")
+        params.append(max_cloud)
+
+    sql = (
+        f"SELECT {', '.join(cols)} FROM scenes WHERE "
+        + " AND ".join(where)
+        # NULLS LAST so a scene with a known low cloud beats an unknown one; then newest.
+        + " ORDER BY cloud_cover ASC NULLS LAST, acq_datetime DESC LIMIT 1"
+    )
+
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+
+    if row is None:
+        return {
+            "found": False,
+            "scene": None,
+            "note": (f"No scenes match event={event_key!r}"
+                     + (f", window={window_type!r}" if window_type else "")
+                     + (f", sensor={sensor!r}" if sensor else "")
+                     + (f", max_cloud={max_cloud}" if max_cloud is not None else "")
+                     + "."),
+        }
+    return {"found": True, "scene": _row_to_scene(row, cols), "note": None}
+
+
 # Register tools without rebinding the module-level names, so they stay directly
 # importable/callable for the Phase-3 isolation gate.
 mcp.tool()(check_coverage)
@@ -452,6 +765,9 @@ mcp.tool()(list_scenes)
 mcp.tool()(get_scene_metrics)
 mcp.tool()(scenes_by_date_range)
 mcp.tool()(compare_windows)
+mcp.tool()(find_scene_pairs)
+mcp.tool()(compare_events)
+mcp.tool()(find_best_scene)
 
 
 if __name__ == "__main__":
