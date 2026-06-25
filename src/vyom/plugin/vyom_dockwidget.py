@@ -32,9 +32,9 @@ import re
 from qgis.PyQt.QtCore import QObject, QThread, QTimer, pyqtSignal, Qt, QUrl
 from qgis.PyQt.QtGui import QColor, QImage, QTextCursor, QTextDocument
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDockWidget, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSlider, QSpinBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QComboBox, QDockWidget, QFileDialog, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSlider, QSpinBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 from qgis.core import (
     QgsColorRampShader, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -407,10 +407,16 @@ class VyomDockWidget(QDockWidget):
         self.copy_btn.setEnabled(False)
         self.copy_btn.setToolTip("Copy last answer to clipboard")
         self.copy_btn.clicked.connect(self._on_copy_answer)
+        self.report_btn = QPushButton("Report")
+        self.report_btn.setFixedWidth(60)
+        self.report_btn.setEnabled(False)
+        self.report_btn.setToolTip("Download this chat session as a PDF report")
+        self.report_btn.clicked.connect(self._on_download_report)
         bottom_row.addWidget(self.template_combo, 1)
         bottom_row.addWidget(self.steps_spin)
         bottom_row.addWidget(self.ask_btn)
         bottom_row.addWidget(self.copy_btn)
+        bottom_row.addWidget(self.report_btn)
         l.addLayout(bottom_row)
 
         return tab
@@ -943,6 +949,7 @@ class VyomDockWidget(QDockWidget):
         answer_md = result.get("answer") or "_(no answer returned)_"
         self._last_answer_md = answer_md
         self.copy_btn.setEnabled(True)
+        self.report_btn.setEnabled(True)
 
         badge = confidence_badge(result)   # None for conversational replies
         if badge:
@@ -1075,6 +1082,124 @@ class VyomDockWidget(QDockWidget):
         if self._last_answer_md:
             QApplication.clipboard().setText(self._last_answer_md)
             self._set_status("Last answer copied to clipboard.")
+
+    # ── PDF session report ────────────────────────────────────────────────────────
+
+    def _report_header_html(self) -> str:
+        """Title block prepended to the exported PDF."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        try:
+            url = self.url_edit.text().strip()
+        except Exception:
+            url = ""
+        try:
+            event = self.event_combo.currentText().strip()
+        except Exception:
+            event = ""
+        meta = "Generated: %s" % ts
+        if url:
+            meta += " &nbsp;|&nbsp; Server: %s" % html.escape(url)
+        if event:
+            meta += " &nbsp;|&nbsp; Event: %s" % html.escape(event)
+        return (
+            '<div style="border-bottom:2px solid #1d4ed8;padding-bottom:6px;'
+            'margin-bottom:12px;">'
+            '<h2 style="color:#1d4ed8;margin:0;">VYOM — Agentic GIS</h2>'
+            '<div style="color:#475569;font-size:13px;">Chat Session Report</div>'
+            '<div style="color:#64748b;font-size:11px;margin-top:3px;">%s</div>'
+            '</div>'
+        ) % meta
+
+    def _capture_map_png(self) -> str:
+        """Save the current map canvas to a temp PNG; return path or '' on failure."""
+        import tempfile
+        try:
+            canvas = self.iface.mapCanvas()
+            out = os.path.join(tempfile.gettempdir(), "vyom_map_%d.png" % id(self))
+            canvas.saveAsImage(out)
+            return out if os.path.exists(out) else ""
+        except Exception:
+            return ""
+
+    def _on_download_report(self):
+        """Export the full chat session (queries + responses + charts + map) to PDF."""
+        if not self._transcript_html:
+            self._set_status("Nothing to export yet — ask a question first.", error=True)
+            return
+
+        import datetime
+        from qgis.PyQt.QtPrintSupport import QPrinter
+
+        default_name = "VYOM_session_%s.pdf" % datetime.datetime.now().strftime(
+            "%Y%m%d_%H%M")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save VYOM session report", default_name, "PDF files (*.pdf)")
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+
+        try:
+            doc = QTextDocument()
+
+            # Resource-type enum is scoped differently across Qt builds; the
+            # integer value of ImageResource is 2 in every Qt version.
+            try:
+                img_res = QTextDocument.ResourceType.ImageResource
+            except AttributeError:
+                img_res = getattr(QTextDocument, "ImageResource", 2)
+
+            # Register the inline chart images so <img src="name"> resolves in print.
+            for name, img_path in self.answer_view._image_paths.items():
+                img = QImage(img_path)
+                if not img.isNull():
+                    doc.addResource(img_res, QUrl(name), img)
+
+            # Capture + register the current map view.
+            map_section = ""
+            map_png = self._capture_map_png()
+            if map_png:
+                mimg = QImage(map_png)
+                if not mimg.isNull():
+                    doc.addResource(img_res, QUrl("__vyom_map__"), mimg)
+                    map_section = (
+                        '<br><div style="border-top:1px solid #e5e7eb;'
+                        'margin-top:10px;padding-top:8px;">'
+                        '<h3 style="color:#1d4ed8;margin:0 0 6px 0;">Map view</h3>'
+                        '<img src="__vyom_map__" width="680"></div>'
+                    )
+
+            doc.setHtml(self._report_header_html() + self._transcript_html + map_section)
+
+            # QPrinter enums are also scoped differently across Qt5/Qt6 builds.
+            def _qenum(scope, attr, fallback):
+                try:
+                    return getattr(getattr(QPrinter, scope), attr)
+                except AttributeError:
+                    return getattr(QPrinter, attr, fallback)
+
+            mode = _qenum("PrinterMode", "HighResolution", 2)
+            pdf_fmt = _qenum("OutputFormat", "PdfFormat", 1)
+
+            printer = QPrinter(mode)
+            printer.setOutputFormat(pdf_fmt)
+            printer.setOutputFileName(path)
+            try:
+                from qgis.PyQt.QtGui import QPageSize
+                printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            except Exception:
+                try:
+                    printer.setPageSize(QPrinter.A4)
+                except Exception:
+                    pass
+            # Qt6/PyQt6 renamed QTextDocument.print_() to print().
+            _print = getattr(doc, "print_", None) or getattr(doc, "print")
+            _print(printer)
+            self._set_status("Report saved: %s" % path)
+        except Exception as exc:
+            self._set_status("Report export failed: %s: %s"
+                             % (type(exc).__name__, exc), error=True)
 
     def _render_trace(self, result: dict):
         lines = []
@@ -1329,6 +1454,7 @@ class VyomDockWidget(QDockWidget):
         self._last_vyom_layer = None
         self._last_answer_md = ""
         self.copy_btn.setEnabled(False)
+        self.report_btn.setEnabled(False)
         self._result_extent = None
         self.run_label.setText("—")
         self._set_status("Session cleared.")

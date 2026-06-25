@@ -47,6 +47,17 @@ def _save(fig, out_dir: Path, name: str) -> str:
     return name
 
 
+def _despine(ax):
+    """Light, consistent styling: drop top/right spines, add a faint y-grid."""
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.spines["left"].set_color("#cccccc")
+    ax.spines["bottom"].set_color("#cccccc")
+    ax.tick_params(colors="#555555", labelsize=8)
+    ax.yaxis.grid(True, color="#e6e6e6", linewidth=0.7)
+    ax.set_axisbelow(True)
+
+
 def _chart_compare_windows(result: dict, out_dir: Path):
     # compare_windows returns ``windows`` as a dict: {window_name: {"mean": ...} | None}
     windows = result.get("windows")
@@ -69,14 +80,19 @@ def _chart_compare_windows(result: dict, out_dir: Path):
     if not values:
         return None
 
-    fig, ax = plt.subplots(figsize=(3.8, 2.4))
-    bars = ax.bar(labels, values, color="#2c7fb8")
-    ax.set_title(f"{metric.upper()} mean by window")
+    # Sequential shade by window order so pre→event→post reads left-to-right.
+    palette = ["#a6bddb", "#3690c0", "#045a8d", "#016c59", "#810f7c"]
+    colors = [palette[i % len(palette)] for i in range(len(values))]
+
+    fig, ax = plt.subplots(figsize=(3.8, 2.5))
+    bars = ax.bar(labels, values, color=colors, edgecolor="white", linewidth=0.8)
+    ax.set_title(f"{metric.upper()} mean by window", fontsize=10)
     ax.set_ylabel(f"{metric} mean")
     ax.axhline(0, color="#888", linewidth=0.8)
     for b, v in zip(bars, values):
         ax.annotate(f"{v:.3f}", (b.get_x() + b.get_width() / 2, v),
                     ha="center", va="bottom" if v >= 0 else "top", fontsize=8)
+    _despine(ax)
     name = f"chart_compare_{metric}_{_hash([labels, values])}.png"
     return _save(fig, out_dir, name)
 
@@ -85,23 +101,26 @@ def _chart_flood_extent(result: dict, out_dir: Path):
     water_pct = _num(result.get("water_area_pct"))
     if water_pct is None:
         return None
+    water_pct = max(0.0, min(100.0, water_pct))
     dry_pct = max(0.0, 100.0 - water_pct)
     km2 = _num(result.get("estimated_water_area_km2"))
     scene = result.get("scene_id") or "scene"
 
-    fig, ax = plt.subplots(figsize=(3.2, 2.2))
-    bars = ax.bar(["Water", "Dry"], [water_pct, dry_pct],
-                  color=["#045a8d", "#bdbdbd"])
+    # Donut: water vs dry, with the water % and km² called out in the centre.
+    fig, ax = plt.subplots(figsize=(3.3, 2.7))
+    ax.pie([water_pct, dry_pct], colors=["#045a8d", "#e6eef3"],
+           startangle=90, counterclock=False,
+           wedgeprops=dict(width=0.42, edgecolor="white", linewidth=1.5))
+    ax.text(0, 0.10, f"{water_pct:.2f}%", ha="center", va="center",
+            fontsize=15, fontweight="bold", color="#045a8d")
+    ax.text(0, -0.20, "water", ha="center", va="center",
+            fontsize=9, color="#666666")
     title = "Flood extent (NDWI)"
     if km2 is not None:
-        title += f" — {km2:g} km² water"
-    ax.set_title(title)
-    ax.set_ylabel("% of valid pixels")
-    ax.set_ylim(0, 100)
-    for b, v in zip(bars, [water_pct, dry_pct]):
-        ax.annotate(f"{v:.2f}%", (b.get_x() + b.get_width() / 2, v),
-                    ha="center", va="bottom", fontsize=8)
-    name = f"chart_flood_{scene}_{_hash([water_pct, dry_pct, km2])}.png"
+        title += f"\n{km2:g} km² inundated"
+    ax.set_title(title, fontsize=10)
+    ax.set_aspect("equal")
+    name = f"chart_flood_donut_{scene}_{_hash([water_pct, dry_pct, km2])}.png"
     return _save(fig, out_dir, name)
 
 
@@ -114,16 +133,28 @@ def _chart_compute_change(result: dict, out_dir: Path):
     inc, dec, unc = (inc or 0.0), (dec or 0.0), (unc or 0.0)
     index = result.get("index") or "index"
 
-    fig, ax = plt.subplots(figsize=(3.5, 2.2))
-    bars = ax.bar(["Increased", "Decreased", "Unchanged"], [inc, dec, unc],
-                  color=["#2166ac", "#b2182b", "#bdbdbd"])
-    ax.set_title(f"{index.upper()} change distribution")
-    ax.set_ylabel("% of valid pixels")
-    ax.set_ylim(0, 100)
-    for b, v in zip(bars, [inc, dec, unc]):
-        ax.annotate(f"{v:.1f}%", (b.get_x() + b.get_width() / 2, v),
-                    ha="center", va="bottom", fontsize=8)
-    name = f"chart_change_{index}_{_hash([inc, dec, unc])}.png"
+    fig, ax = plt.subplots(figsize=(4.0, 1.9))
+    segments = [("Increased", inc, "#2166ac"),
+                ("Decreased", dec, "#b2182b"),
+                ("Unchanged", unc, "#bdbdbd")]
+    left = 0.0
+    for label, val, color in segments:
+        ax.barh(0, val, left=left, color=color, edgecolor="white",
+                height=0.5, label=f"{label} ({val:.1f}%)")
+        if val >= 7:  # only annotate segments wide enough to hold the text
+            ax.text(left + val / 2, 0, f"{val:.0f}%", ha="center", va="center",
+                    color="white", fontsize=8, fontweight="bold")
+        left += val
+    ax.set_xlim(0, max(100.0, left))
+    ax.set_ylim(-0.5, 0.5)
+    ax.set_yticks([])
+    ax.set_xlabel("% of valid pixels")
+    ax.set_title(f"{index.upper()} change composition", fontsize=10)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.45),
+              ncol=3, fontsize=7, frameon=False)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    name = f"chart_change_stack_{index}_{_hash([inc, dec, unc])}.png"
     return _save(fig, out_dir, name)
 
 
@@ -170,16 +201,24 @@ def _chart_compare_events(result: dict, out_dir: Path):
     if not values:
         return None
 
-    fig, ax = plt.subplots(figsize=(4.0, 2.4))
-    bars = ax.bar(range(len(values)), values, color="#2c7fb8")
-    ax.set_title(f"{metric} by event ({result.get('window', 'event')})")
-    ax.set_ylabel(metric)
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=6)
+    fig, ax = plt.subplots(figsize=(4.4, 0.6 + 0.45 * len(values)))
+    ypos = list(range(len(values)))
+    bars = ax.barh(ypos, values, color="#2c7fb8", edgecolor="white", linewidth=0.6)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.invert_yaxis()  # first event on top
+    ax.set_xlabel(metric)
+    ax.set_title(f"{metric} by event ({result.get('window', 'event')})", fontsize=10)
+    vmax = max(values) if values else 1.0
     for b, v in zip(bars, values):
-        ax.annotate(f"{v:.2f}", (b.get_x() + b.get_width() / 2, v),
-                    ha="center", va="bottom", fontsize=7)
-    name = f"chart_events_{metric}_{_hash([labels, values])}.png"
+        ax.annotate(f"{v:.2f}", (v, b.get_y() + b.get_height() / 2),
+                    xytext=(3, 0), textcoords="offset points",
+                    ha="left", va="center", fontsize=7)
+    ax.set_xlim(min(0, min(values)), vmax * 1.15)
+    _despine(ax)
+    ax.xaxis.grid(True, color="#e6e6e6", linewidth=0.7)
+    ax.yaxis.grid(False)
+    name = f"chart_events_hbar_{metric}_{_hash([labels, values])}.png"
     return _save(fig, out_dir, name)
 
 
