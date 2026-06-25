@@ -127,13 +127,23 @@ def _vyom_bubble(badge_html: str, body_html: str) -> str:
     )
 
 
-def _thinking_bubble(steps: list) -> str:
-    """Loader bubble shown while the agent is working."""
+# Dot-animation frames for the loader (font-safe — no emoji/braille).
+_SPIN_FRAMES = ["", ".", "..", "..."]
+
+
+def _thinking_bubble(steps: list, spinner: str = "") -> str:
+    """Loader bubble shown while the agent is working.
+
+    ``spinner`` is the animated suffix (a growing run of dots) supplied by the
+    spin-timer so slow tool calls show visible progress.
+    """
+    dots = '<font color="#2563eb">%s</font>' % (spinner or "")
     if steps:
         steps_html = "<br>".join(steps)
-        body = (f'<font color="#94a3b8"><i>thinking…</i></font><br>{steps_html}')
+        body = (f'<font color="#94a3b8"><i>working{dots}</i></font>'
+                f'<br>{steps_html}')
     else:
-        body = '<font color="#94a3b8"><i>thinking…  ⏳</i></font>'
+        body = f'<font color="#94a3b8"><i>thinking{dots}</i></font>'
     return (
         '<table width="100%" cellpadding="0" cellspacing="4">'
         '<tr>'
@@ -306,6 +316,7 @@ class VyomDockWidget(QDockWidget):
         self._thinking_steps = []        # tool steps accumulated during streaming
         self._streaming_answer = ""      # tokens accumulated during answer streaming
         self._got_first_token = False    # True once the LLM starts outputting text
+        self._busy = False               # a query/op is in flight — lock new asks
         self._last_answer_md = ""        # for "copy answer"
         self._last_vyom_layer = None     # for the opacity slider
         self._result_extent = None       # zoom union for a query's layers
@@ -317,6 +328,11 @@ class VyomDockWidget(QDockWidget):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(60)
         self._render_timer.timeout.connect(self._render_all)
+        # Spinner: animates the "thinking…" loader so slow tool calls feel alive.
+        self._spin_frame = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(320)
+        self._spin_timer.timeout.connect(self._on_spin_tick)
         self._build_ui()
 
     # ── UI construction ──────────────────────────────────────────────────────────
@@ -562,9 +578,17 @@ class VyomDockWidget(QDockWidget):
         thread.start()
 
     def _set_busy(self, busy: bool, msg: str = ""):
+        self._busy = busy
         for btn in (self.connect_btn, self.ask_btn, self.aoi_btn, self.rerun_btn,
                     self.load_scenes_btn):
             btn.setEnabled(not busy)
+        # Lock the query box too — otherwise pressing Enter fires a second query
+        # while one is still running.
+        self.query_edit.setEnabled(not busy)
+        self.query_edit.setPlaceholderText(
+            "VYOM is answering… please wait" if busy
+            else "Ask anything… (Enter to send, Shift+Enter for newline)")
+        self.ask_btn.setText("● …" if busy else "Ask")
         if busy:
             self._set_status(msg)
 
@@ -715,6 +739,9 @@ class VyomDockWidget(QDockWidget):
     # ── ask / answer ──────────────────────────────────────────────────────────────
 
     def _on_ask(self):
+        if self._busy:
+            self._set_status("VYOM is still answering — please wait…", error=True)
+            return
         question = self.query_edit.toPlainText().strip()
         if not question:
             self._set_status("Enter a question first.", error=True)
@@ -739,6 +766,8 @@ class VyomDockWidget(QDockWidget):
     def _run_stream(self, question: str, max_steps: int, aoi_geojson: str):
         """Launch a _StreamWorker on a background QThread."""
         self._set_busy(True, "Asking VYOM (streaming)…")
+        self._spin_frame = 0
+        self._spin_timer.start()
         client = self._client()
         thread = QThread()
         worker = _StreamWorker(client, question, max_steps, aoi_geojson)
@@ -755,13 +784,15 @@ class VyomDockWidget(QDockWidget):
             step_html = self._format_tool_step(event)
             self._thinking_steps.append(step_html)
             if not self._got_first_token:
-                self._thinking_html = _thinking_bubble(self._thinking_steps)
+                self._thinking_html = _thinking_bubble(
+                    self._thinking_steps, _SPIN_FRAMES[self._spin_frame])
                 self._render_all()
 
         def _on_token(token: str):
             self._streaming_answer += token
             if not self._got_first_token:
                 self._got_first_token = True
+                self._spin_timer.stop()  # answer started — loader done
             # Show growing answer; debounced via QTimer
             self._thinking_html = self._make_streaming_html()
             if not self._render_timer.isActive():
@@ -769,6 +800,7 @@ class VyomDockWidget(QDockWidget):
 
         def _on_done(result):
             self._render_timer.stop()
+            self._spin_timer.stop()
             self._set_busy(False)
             _cleanup()
             self._thinking_html = ""
@@ -778,6 +810,7 @@ class VyomDockWidget(QDockWidget):
 
         def _on_err(msg):
             self._render_timer.stop()
+            self._spin_timer.stop()
             self._set_busy(False)
             _cleanup()
             self._thinking_html = ""
@@ -831,6 +864,15 @@ class VyomDockWidget(QDockWidget):
         return (f'<font color="#64748b">{icon} #{step} '
                 f'<b>{html.escape(name)}</b></font>'
                 f'<font color="#475569"> → {summary}</font>')
+
+    def _on_spin_tick(self):
+        """Advance the loader dots while the agent is still working (pre-answer)."""
+        if not self._busy or self._got_first_token:
+            return
+        self._spin_frame = (self._spin_frame + 1) % len(_SPIN_FRAMES)
+        self._thinking_html = _thinking_bubble(
+            self._thinking_steps, _SPIN_FRAMES[self._spin_frame])
+        self._render_all()
 
     def _make_streaming_html(self) -> str:
         """Render the in-progress VYOM bubble showing typed tokens so far."""
